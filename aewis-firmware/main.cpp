@@ -35,14 +35,11 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <PubSubClient.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <time.h>
-#include <SensirionI2cScd4x.h>
+#include <SensirionI2CScd4x.h>
 #include <SensirionI2CSgp41.h>
 #include <VOCGasIndexAlgorithm.h>
 #include <GxEPD2_BW.h>
@@ -70,16 +67,6 @@
 #define ADDR_SCD4X    0x62
 #define ADDR_SGP4X    0x59
 
-// ─────────────────────────────────────────────────────────────
-//  BLE GATT UUIDs  ← must match BLEProvisioner.jsx exactly
-// ─────────────────────────────────────────────────────────────
-#define BLE_SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BLE_CHR_ID    "4fafc202-1fb5-459e-8fcc-c5c9c331914b"  // READ        : device ID
-#define BLE_CHR_SSID  "4fafc203-1fb5-459e-8fcc-c5c9c331914b"  // WRITE       : WiFi SSID
-#define BLE_CHR_PASS  "4fafc204-1fb5-459e-8fcc-c5c9c331914b"  // WRITE       : WiFi password
-#define BLE_CHR_STAT  "4fafc205-1fb5-459e-8fcc-c5c9c331914b"  // READ+NOTIFY : status
-#define BLE_CHR_URL   "4fafc206-1fb5-459e-8fcc-c5c9c331914b"  // WRITE       : backend URL
-#define BLE_CHR_SCAN  "4fafc207-1fb5-459e-8fcc-c5c9c331914b"  // READ        : WiFi scan JSON
 
 // ─────────────────────────────────────────────────────────────
 //  Sensor thresholds  (EPA NAAQS / ASHRAE 62.1)
@@ -151,14 +138,14 @@
 #define MQTT_PORT          1883
 #define MQTT_KEEPALIVE_S   60
 #define MQTT_RETRY_MS      30000UL   // reconnect interval
-#define BLE_STOP_DELAY_MS  5000UL    // keep BLE alive after "connected" notify
+
 #define SGP41_COND_MS      30000UL
 #define AP_TIMEOUT_MS      600000UL  // 10 min — stop AP if nobody provisions
 
 // ─────────────────────────────────────────────────────────────
 //  Sensor objects
 // ─────────────────────────────────────────────────────────────
-SensirionI2cScd4x    scd4x;
+SensirionI2CScd4x    scd4x;
 SensirionI2CSgp41    sgp41;
 VOCGasIndexAlgorithm vocAlgo;
 HardwareSerial       coSerial(1);
@@ -194,30 +181,19 @@ static float s_no2R0    = NO2_R0_SEED;
 bool     g_wifiOk          = false;
 bool     g_mqttOk          = false;
 uint32_t g_lastMqttRetry   = 0;
-bool     g_bleStopPending  = false;
-uint32_t g_bleConnectedTs  = 0;
-
-// BLE provisioning  (written from BLE callback, read in main loop)
-// g_provTrigger is set with a 500 ms delay so the URL characteristic write
-// (which arrives AFTER the password write) has time to land before we act.
-volatile bool         g_provTrigger    = false;
-volatile unsigned long g_provTriggerMs = 0;   // millis() when trigger was set
+// Provisioning  (written from Captive Portal)
 String           g_pendingSSID, g_pendingPass, g_pendingURL, g_pendingCode, g_pendingMqtt;
-#define PROV_GRACE_MS  500UL   // wait this long after password write before processing
 
-BLECharacteristic* g_pStatChar  = nullptr;
-bool               g_bleRunning = false;
-
-// AP + Captive Portal provisioning  (iOS / universal fallback)
+// AP + Captive Portal provisioning
 WebServer  g_apServer(80);
 DNSServer  g_dnsServer;
 bool       g_apRunning = false;
 uint32_t   g_apStartMs = 0;
 String     g_apPass;          // WPA2 password = last 6 MAC hex digits (print on device label)
-String     g_wifiScanJson = "[]";  // cached WiFi scan result — served via BLE + AP HTTP
+String     g_wifiScanJson = "[]";  // cached WiFi scan result
 
-enum DevState { ST_BLE_PROV, ST_WIFI_CONN, ST_RUNNING };
-DevState g_state = ST_BLE_PROV;
+enum DevState { ST_PROV, ST_WIFI_CONN, ST_RUNNING };
+DevState g_state = ST_PROV;
 
 // ═══════════════════════════════════════════════════════════════
 //  QUALITY LABELS  (unchanged)
@@ -530,26 +506,18 @@ void drawProvisioningScreen() {
 
         display.setFont(&FreeMonoBold12pt7b);
 
-        char line[48];
-        snprintf(line, sizeof(line), "BLE : %s", g_bleName.c_str());
-        display.getTextBounds(line, 0, 0, &bx, &by, &bw, &bh);
-        display.setCursor((display.width() - bw) / 2 - bx, 92);
-        display.print(line);
 
         snprintf(line, sizeof(line), "ID  : %s", g_deviceId.c_str());
         display.getTextBounds(line, 0, 0, &bx, &by, &bw, &bh);
         display.setCursor((display.width() - bw) / 2 - bx, 130);
         display.print(line);
 
-        display.setCursor(LABEL_X, 175);  display.print("Option A (Android/PC):");
-        display.setCursor(LABEL_X, 205);  display.print("  Open dashboard > Add Device");
-
-        display.setCursor(LABEL_X, 232);  display.print("Option B (iOS/any browser):");
+        display.setCursor(LABEL_X, 175);  display.print("To setup, connect to:");
         char apLine[40];
         snprintf(apLine, sizeof(apLine), "  WiFi: %s", g_bleName.c_str());
-        display.setCursor(LABEL_X, 258);  display.print(apLine);
+        display.setCursor(LABEL_X, 205);  display.print(apLine);
         snprintf(apLine, sizeof(apLine), "  Pass: %s", g_apPass.c_str());
-        display.setCursor(LABEL_X, 282);  display.print(apLine);
+        display.setCursor(LABEL_X, 235);  display.print(apLine);
     } while (display.nextPage());
 }
 
@@ -658,13 +626,8 @@ button:active{background:#1256a0}
 <label>WiFi Password</label>
 <input name="pass" type="password" placeholder="Leave blank if open network">
 <label>Dashboard URL</label>
-<input name="url" type="text" placeholder="http://192.168.1.x:3000 or https://app.railway.app">
-<label>MQTT Host <span style="font-weight:normal;color:#888">(leave blank = same as Dashboard host)</span></label>
-<input name="mqtt" type="text" placeholder="xxxx.hivemq.cloud:8883  or  host:1883">
-<label>MQTT Username <span style="font-weight:normal;color:#888">(leave blank if none)</span></label>
-<input name="mqttuser" type="text" autocomplete="off" placeholder="">
-<label>MQTT Password <span style="font-weight:normal;color:#888">(leave blank if none)</span></label>
-<input name="mqttpass" type="password" autocomplete="off" placeholder="">
+<div style="font-size:13px; color:#555; margin-top:4px;">https://strong-courtesy-aqm.up.railway.app</div>
+<!-- Hardcoded MQTT and Dashboard URLs -->
 <label>Dashboard Code <span style="font-weight:normal;color:#888">(6-digit code from Add Device)</span></label>
 <input name="code" type="text" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="123456">
 <button type="submit">Connect Device</button>
@@ -704,10 +667,10 @@ void handleAPRoot() {
 void handleAPSave() {
     String ssid     = g_apServer.arg("ssid");
     String pass     = g_apServer.arg("pass");
-    String url      = g_apServer.arg("url");
-    String mqttHost = g_apServer.arg("mqtt");
-    String mqttUser = g_apServer.arg("mqttuser");
-    String mqttPass = g_apServer.arg("mqttpass");
+    String url      = "https://strong-courtesy-aqm.up.railway.app";
+    String mqttHost = "kodama.proxy.rlwy.net:43148";
+    String mqttUser = "";
+    String mqttPass = "";
     String code     = g_apServer.arg("code");
     g_apServer.send(200, "text/html", String(AP_SAVE_PAGE));
     if (ssid.isEmpty()) return;
@@ -779,113 +742,7 @@ void stopAP() {
 // ═══════════════════════════════════════════════════════════════
 //  BLE GATT SERVER
 // ═══════════════════════════════════════════════════════════════
-class ProvisionCallbacks : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* pChar) override {
-        String uuid = pChar->getUUID().toString();
-        String val  = String(pChar->getValue().c_str());
 
-        if (uuid.equalsIgnoreCase(BLE_CHR_SSID)) {
-            g_pendingSSID = val;
-            Serial.printf("[BLE] SSID received: %s\n", val.c_str());
-        } else if (uuid.equalsIgnoreCase(BLE_CHR_PASS)) {
-            g_pendingPass = val;
-            // Don't fire immediately — BLEProvisioner.jsx writes URL *after* password.
-            // Set a timestamp; loop() waits PROV_GRACE_MS before acting (Bug fix #1).
-            g_provTrigger    = true;
-            g_provTriggerMs  = millis();
-            Serial.println("[BLE] Password received — will connect after grace period");
-        } else if (uuid.equalsIgnoreCase(BLE_CHR_URL)) {
-            g_pendingURL    = val;
-            g_provTriggerMs = millis();   // reset grace timer: URL is last write
-            Serial.printf("[BLE] Backend URL: %s\n", val.c_str());
-        }
-    }
-};
-
-void startBLE() {
-    BLEDevice::init(g_bleName.c_str());
-    BLEServer*  pServer = BLEDevice::createServer();
-    BLEService* pSvc    = pServer->createService(BLE_SVC_UUID);
-
-    // DEVICE_ID — read only
-    BLECharacteristic* pId = pSvc->createCharacteristic(
-        BLE_CHR_ID, BLECharacteristic::PROPERTY_READ);
-    pId->setValue(g_deviceId.c_str());
-
-    // WIFI_SSID — write
-    BLECharacteristic* pSsid = pSvc->createCharacteristic(
-        BLE_CHR_SSID, BLECharacteristic::PROPERTY_WRITE);
-    pSsid->setCallbacks(new ProvisionCallbacks());
-
-    // WIFI_PASSWORD — write
-    BLECharacteristic* pPass = pSvc->createCharacteristic(
-        BLE_CHR_PASS, BLECharacteristic::PROPERTY_WRITE);
-    pPass->setCallbacks(new ProvisionCallbacks());
-
-    // PROV_STATUS — read + notify
-    g_pStatChar = pSvc->createCharacteristic(
-        BLE_CHR_STAT,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    g_pStatChar->addDescriptor(new BLE2902());
-    g_pStatChar->setValue("idle");
-
-    // BACKEND_URL — write (optional)
-    BLECharacteristic* pUrl = pSvc->createCharacteristic(
-        BLE_CHR_URL, BLECharacteristic::PROPERTY_WRITE);
-    pUrl->setCallbacks(new ProvisionCallbacks());
-
-    // WIFI_SCAN — read only: JSON array of nearby SSIDs sorted by signal strength
-    BLECharacteristic* pScan = pSvc->createCharacteristic(
-        BLE_CHR_SCAN, BLECharacteristic::PROPERTY_READ);
-    pScan->setValue(g_wifiScanJson.c_str());
-
-    pSvc->start();
-
-    // ── Advertising ──────────────────────────────────────────
-    // BLE primary ad packet limit = 31 bytes.
-    // 128-bit UUID alone = 18 bytes. Name "AEWIS-XXXX" = 12 bytes. Flags = 3 bytes.
-    // Total = 33 bytes → OVERFLOW → macOS silently drops the packet (Windows is lenient).
-    //
-    // Solution: name ONLY in primary packet (macOS needs name to match namePrefix filter).
-    //           UUID in scan response only (Windows reads scan responses; macOS discovers
-    //           services via GATT after connection anyway).
-    //
-    // Primary packet:   Flags(3) + Name(12) = 15 bytes  ✓ fits in 31
-    // Scan response:    UUID(18)            = 18 bytes  ✓ fits in 31
-
-    // Primary packet: Flags(3) + Complete Name(2+len) — MUST include flags or scanners
-    // will not show the device as discoverable.  0x06 = General Discoverable + BLE-only.
-    BLEAdvertisementData primaryAd;
-    primaryAd.setFlags(0x06);
-    primaryAd.setName(g_bleName.c_str());
-
-    // Scan response: 128-bit service UUID (18 bytes — fits exactly in 31-byte limit).
-    // Windows, Android and Web Bluetooth can filter by service UUID from scan response.
-    BLEAdvertisementData scanRespAd;
-    scanRespAd.setCompleteServices(BLEUUID(BLE_SVC_UUID));
-
-    BLEAdvertising* pAdv = BLEDevice::getAdvertising();
-    pAdv->setAdvertisementData(primaryAd);
-    pAdv->setScanResponseData(scanRespAd);
-    pAdv->setScanResponse(true);
-    BLEDevice::startAdvertising();
-    g_bleRunning = true;
-    Serial.printf("[BLE] Advertising as %s\n", g_bleName.c_str());
-}
-
-void stopBLE() {
-    if (!g_bleRunning) return;
-    BLEDevice::stopAdvertising();
-    g_bleRunning = false;
-    Serial.println("[BLE] Stopped");
-}
-
-void notifyProvStatus(const char* status) {
-    if (!g_pStatChar) return;
-    g_pStatChar->setValue(status);
-    g_pStatChar->notify();
-    Serial.printf("[BLE] PROV_STATUS → %s\n", status);
-}
 
 // ═══════════════════════════════════════════════════════════════
 //  WiFi + NTP
@@ -1023,17 +880,29 @@ void publishReading(uint16_t co2, float temp, float rh,
         strncpy(ts, tmp, sizeof(ts) - 1);
     }
 
-    char topic[80], payload[320];
-    snprintf(topic, sizeof(topic), "aewis/devices/%s/readings", g_deviceId.c_str());
+    char payload[380];
     snprintf(payload, sizeof(payload),
-        "{\"co2\":%s,\"temp\":%.1f,\"rh\":%.1f,\"voc\":%s,"
+        "{\"device_id\":\"%s\",\"co2\":%s,\"temp\":%.1f,\"rh\":%.1f,\"voc\":%s,"
         "\"co\":%s,\"o3\":%s,\"no2\":%s,\"ts\":%s}",
-        co2S, temp, rh, vocS, coS, o3S, no2S, ts);
+        g_deviceId.c_str(), co2S, temp, rh, vocS, coS, o3S, no2S, ts);
 
-    if (mqtt.publish(topic, payload))
-        Serial.printf("[MQTT] ✓ %s\n", payload);
-    else
-        Serial.println("[MQTT] publish failed — buffer too small?");
+    if (g_backendUrl.isEmpty()) {
+        Serial.println("[HTTP] No backend URL to post readings");
+        return;
+    }
+
+    HTTPClient http;
+    http.begin(g_backendUrl + "/api/readings");
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(payload);
+    if (code == 201 || code == 200) {
+        Serial.printf("[HTTP] ✓ Readings sent (%d)\n", code);
+        g_mqttOk = true; // Use MQTT status LED/icon to represent HTTP success
+    } else {
+        Serial.printf("[HTTP] ✗ Failed to send readings: %d - %s\n", code, http.errorToString(code).c_str());
+        g_mqttOk = false;
+    }
+    http.end();
 }
 
 bool connectMQTT(uint16_t port = MQTT_PORT) {
@@ -1108,6 +977,12 @@ void setup() {
     // Wait up to 3 s for serial monitor; boot normally if none is attached
     { uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10); delay(100); }
 
+    // ── ALWAYS ERASE PREVIOUS MEMORY (User requested) ─────────
+    prefs.begin("aewis", false); 
+    prefs.clear(); 
+    prefs.end();
+    Serial.println("[BOOT] Device memory has been completely erased.");
+
     // ── Hardware init ─────────────────────────────────────────
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(100000);
@@ -1120,10 +995,13 @@ void setup() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_0db);   // 0–0.75 V range for NO2 — critical for clean-air signal
 
-    scd4x.begin(Wire, ADDR_SCD4X);
-    scd4x.stopPeriodicMeasurement();
+    scd4x.begin(Wire);
+    uint16_t scdErr = scd4x.stopPeriodicMeasurement();
+    if (scdErr) Serial.printf("[I2C] SCD4x stopPeriodicMeasurement failed: %d\n", scdErr);
     delay(500);
-    scd4x.startPeriodicMeasurement();
+    scdErr = scd4x.startPeriodicMeasurement();
+    if (scdErr) Serial.printf("[I2C] SCD4x startPeriodicMeasurement failed: %d\n", scdErr);
+
 
     sgp41.begin(Wire);
     g_sgpCondStart = millis();
@@ -1156,14 +1034,12 @@ void setup() {
     prefs.end();
 
     if (storedSSID.isEmpty()) {
-        // ── FIRST BOOT: start BLE + AP provisioning ──────────
-        // BLE handles Android/Windows via web dashboard wizard.
+        // ── FIRST BOOT: start AP provisioning ──────────
         // AP + Captive Portal handles iOS and any device with a browser.
-        Serial.println("[BOOT] No credentials — starting BLE + AP provisioning");
-        g_state = ST_BLE_PROV;
+        Serial.println("[BOOT] No credentials — starting AP provisioning");
+        g_state = ST_PROV;
         drawProvisioningScreen();
-        startAP();    // must be before startBLE so WiFi mode is set first
-        startBLE();
+        startAP();
     } else {
         // ── NORMAL BOOT: connect WiFi + MQTT ─────────────────
         Serial.printf("[BOOT] Credentials found — connecting to %s\n",
@@ -1172,17 +1048,9 @@ void setup() {
         drawConnectingScreen(storedSSID);
 
         if (connectWiFi(storedSSID, storedPass)) {
-            // Prefer explicit mqtt_host from NVS; fall back to backend URL host
-            if (!storedMqtt.isEmpty()) {
-                g_mqttHost = extractHost(storedMqtt);
-                uint16_t p = MQTT_PORT;
-                int c = storedMqtt.lastIndexOf(':');
-                if (c > 6) p = (uint16_t)storedMqtt.substring(c + 1).toInt();
-                connectMQTT(p);
-            } else {
-                g_mqttHost = g_backendUrl.isEmpty() ? "" : extractHost(g_backendUrl);
-                connectMQTT();
-            }
+            // Register with backend via HTTP (MQTT disabled due to Railway proxy limitations)
+            httpProvision();
+            // g_mqttHost and connectMQTT() removed to prevent rc=-2 loops
         }
         drawStaticLayout();
         updateStatusBar(g_wifiOk, g_mqttOk,
@@ -1230,17 +1098,14 @@ void loop() {
         }
     }
 
-    // ── BLE provisioning: wait for grace period then connect ───
-    // Grace period (Bug fix #1): URL characteristic is written by the browser
-    // AFTER the password write. Wait PROV_GRACE_MS so URL arrives before we act.
+    // ── Provisioning: wait for grace period then connect ───
     if (g_provTrigger && (millis() - g_provTriggerMs >= PROV_GRACE_MS)) {
         g_provTrigger = false;
 
         if (!g_pendingURL.isEmpty())  g_backendUrl = g_pendingURL;
 
-        // Tear down both provisioning transports before switching to STA mode
+        // Tear down provisioning transport before switching to STA mode
         stopAP();
-        notifyProvStatus("connecting");
         drawConnectingScreen(g_pendingSSID);
 
         if (connectWiFi(g_pendingSSID, g_pendingPass)) {
@@ -1254,40 +1119,16 @@ void loop() {
                 prefs.putString("mqtt_host", g_pendingMqtt);
             prefs.end();
 
-            // Notify browser wizard
-            notifyProvStatus("connected");
-            g_bleStopPending = true;
-            g_bleConnectedTs = millis();
-
-            // MQTT host: explicit override → extract from backend URL → empty (skip)
-            if (!g_pendingMqtt.isEmpty())
-                g_mqttHost = extractHost(g_pendingMqtt);  // strips port, handled by setServer
-            else
-                g_mqttHost = g_backendUrl.isEmpty() ? "" : extractHost(g_backendUrl);
-
-            // MQTT port: if pendingMqtt contains ":NNNNN", parse it
-            uint16_t mqttPort = MQTT_PORT;
-            int colonPos = g_pendingMqtt.lastIndexOf(':');
-            if (colonPos > 6) mqttPort = (uint16_t)g_pendingMqtt.substring(colonPos + 1).toInt();
-
-            // Register with backend + MQTT
+            // Register with backend via HTTP
             httpProvision();
-            connectMQTT(mqttPort);
 
             drawStaticLayout();
             updateStatusBar(g_wifiOk, g_mqttOk,
                             WiFi.localIP().toString());
             g_state = ST_RUNNING;
         } else {
-            notifyProvStatus("failed");
             drawProvisioningScreen();   // back to setup screen
         }
-    }
-
-    // ── BLE teardown (5 s after "connected" — browser has time to receive) ──
-    if (g_bleStopPending && millis() - g_bleConnectedTs > BLE_STOP_DELAY_MS) {
-        stopBLE();
-        g_bleStopPending = false;
     }
 
     // ── MQTT keepalive + auto-reconnect ──────────────────────
@@ -1323,13 +1164,15 @@ void loop() {
 
         // SCD4x — CO2, temperature, humidity
         bool rdy = false;
-        scd4x.getDataReadyStatus(rdy);
-        if (rdy) {
+        uint16_t err = scd4x.getDataReadyFlag(rdy);
+        if (err == 0 && rdy) {
             uint16_t co2 = 0; float t = 0, h = 0;
             if (scd4x.readMeasurement(co2, t, h) == 0 && co2 != 0) {
                 lastCO2 = co2; lastTemp = t; lastRH = h;
                 g_tempC = t;   g_rhPct  = h;
             }
+        } else if (err) {
+            Serial.printf("[I2C] SCD4x getDataReadyFlag error: %d\n", err);
         }
 
         lastCO  = readCO_ppm();
@@ -1345,8 +1188,8 @@ void loop() {
                             g_wifiOk ? WiFi.localIP().toString() : "");
         }
 
-        // Publish to MQTT → backend → dashboard
-        if (g_state == ST_RUNNING && mqtt.connected())
+        // Publish to backend → dashboard via HTTP POST
+        if (g_state == ST_RUNNING)
             publishReading(lastCO2, lastTemp, lastRH,
                            lastVOC, lastCO, lastO3, lastNO2);
     }

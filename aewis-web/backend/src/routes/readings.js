@@ -3,6 +3,10 @@ const { z } = require('zod');
 const { query } = require('../services/db');
 const { requireAuth } = require('../middleware/auth');
 const { validateQuery } = require('../middleware/validate');
+const { v4: uuidv4 } = require('uuid');
+const { calcAQI } = require('../services/aqiCalc');
+const { processReading } = require('../services/alertEngine');
+const { emitSensorUpdate } = require('../socket/emitter');
 
 const router = express.Router();
 
@@ -22,6 +26,52 @@ function fmtReading(r) {
     temp: r.temp, rh: r.rh, aqi: r.aqi, primaryPollutant: r.primary_pollutant,
   };
 }
+
+// POST /api/readings (from ESP32 directly)
+router.post('/', async (req, res) => {
+  const data = req.body;
+  const deviceId = data.device_id;
+  if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+
+  try {
+    const { rows } = await query('SELECT id FROM devices WHERE id = $1', [deviceId]);
+    if (!rows.length) return res.status(404).json({ error: 'Device not found' });
+
+    const { aqi, primaryPollutant } = calcAQI(data);
+    const readingId = uuidv4();
+
+    const { rows: [reading] } = await query(
+      `INSERT INTO readings
+         (id, device_id, ts, pm25, pm10, pm1, co, no2, co2, o3, voc, temp, rh, aqi, primary_pollutant)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       RETURNING *`,
+      [
+        readingId, deviceId,
+        data.ts ? new Date(data.ts) : new Date(),
+        data.pm25 ?? null, data.pm10 ?? null, data.pm1 ?? null,
+        data.co   ?? null, data.no2  ?? null, data.co2  ?? null,
+        data.o3   ?? null, data.voc  ?? null,
+        data.temp ?? null, data.rh   ?? null,
+        aqi, primaryPollutant,
+      ]
+    );
+
+    await query(
+      'UPDATE devices SET last_seen = NOW(), status = $1 WHERE id = $2',
+      ['online', deviceId]
+    );
+
+    const readingObj = fmtReading(reading);
+    emitSensorUpdate(deviceId, readingObj);
+    await processReading(deviceId, readingObj, readingId);
+
+    res.status(201).json(readingObj);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // GET /api/readings/latest?deviceId=
 const latestSchema = z.object({ deviceId: z.string().min(1) });
