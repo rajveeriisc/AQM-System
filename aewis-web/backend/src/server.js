@@ -55,7 +55,7 @@ async function start() {
     initSocket(server);
     startMqtt();
 
-    server.listen(PORT, () => {
+    server.listen(PORT, '0.0.0.0', () => {
       console.log(`AEWIS API running on port ${PORT}`);
     });
   } catch (err) {
