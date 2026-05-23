@@ -1,0 +1,10 @@
+node_modules/
+.env
+.DS_Store
+logs/
+exports/
+frontend/dist/
+aewis-web/backend/.env
+aewis-web/logs/
+aewis-web/exports/
+aewis-web/frontend/dist/

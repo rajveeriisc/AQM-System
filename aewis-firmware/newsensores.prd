@@ -1,0 +1,604 @@
+/**
+ * ═══════════════════════════════════════════════════════════════
+ *  Air Quality Monitor — ESP32-S3 + 4.2" E-Paper GDEY042T81
+ * ───────────────────────────────────────────────────────────────
+ *  Sensors:
+ *    SCD4x  — CO2, temperature, humidity  (I2C 0x62)
+ *    SGP41  — VOC index                   (I2C 0x59)
+ *    ZE07-CO — Carbon monoxide            (UART, Winsen Q&A mode)
+ *    ZE25A-O3 — Ozone                     (UART, Winsen Q&A mode)
+ *    SEN0574 — NO2 (Fermion MEMS analog)  (ADC pin 4)
+ *
+ *  Verified fixes:
+ *    [CO]  ZE07-CO switched to Q&A mode on boot (default is upload
+ *          mode; Q&A required for winsenQuery to work correctly).
+ *    [CO]  × 0.1 multiplier confirmed — Table 4 & Table 8.
+ *    [NO2] R0 hard-initialised on first post-warmup sample.
+ *    [NO2] Conservative minimum tracking (now with 1-hour τ) resists noise.
+ *    [NO2] 256-sample trim-mean ADC (discard top+bottom 32) + ADC_0db.
+ *    [NO2] Calibrated R0 seed = 235508 Ω (measured, AC-room baseline).
+ *    [NO2] Warmup 5 min (datasheet: >5 min on power-on).
+ *    [NO2] Dead-band (Rs/R0 < 1.08) + better resolution eliminates 0.6 ppm phantom offset.
+ *    [O3]  × 0.001 confirmed — ZE25A variant, 1 ppb per count.
+ *    [O3]  Clamped to 2.0 ppm (ZE25A hardware saturation limit).
+ *    [SER] Serial mapped to UART0 — set "USB CDC On Boot" = Disabled
+ *          in Arduino IDE Tools menu, or use Serial0 explicitly.
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SensirionI2cScd4x.h>
+#include <SensirionI2CSgp41.h>
+#include <VOCGasIndexAlgorithm.h>
+#include <GxEPD2_BW.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <Fonts/FreeMonoBold18pt7b.h>
+
+// ─────────────────────────────────────────────────────────────
+//  Pin assignments
+// ─────────────────────────────────────────────────────────────
+#define PIN_I2C_SDA    21
+#define PIN_I2C_SCL    13
+#define PIN_CO_RX      18
+#define PIN_CO_TX      17
+#define PIN_O3_RX      40
+#define PIN_O3_TX      39
+#define PIN_NO2_ADC     4
+
+#define EPD_SCK        12
+#define EPD_MOSI       11
+#define EPD_CS         10
+#define EPD_DC         15
+#define EPD_RST        16
+#define EPD_BUSY        5
+
+#define ADDR_SCD4X    0x62
+#define ADDR_SGP4X    0x59
+
+// ─────────────────────────────────────────────────────────────
+//  Air quality thresholds  (EPA NAAQS / ASHRAE 62.1)
+// ─────────────────────────────────────────────────────────────
+#define CO2_GOOD       800           // ppm  — ASHRAE 62.1
+#define CO2_MOD       1200           // ppm
+#define VOC_GOOD       100           // VOC index
+#define VOC_MOD        200
+#define CO_GOOD          9.0f        // ppm  — EPA 8-hr
+#define CO_MOD          35.0f        // ppm  — EPA 1-hr
+#define O3_GOOD          0.070f      // ppm  — EPA 8-hr (70 ppb)
+#define O3_MOD           0.085f      // ppm  — sensitive groups (85 ppb)
+#define NO2_GOOD         0.053f      // ppm  — EPA annual (53 ppb)
+#define NO2_MOD          0.100f      // ppm  — 100 ppb
+
+// ─────────────────────────────────────────────────────────────
+//  ZE07-CO
+//  concentration = (Byte[2]×256 + Byte[3]) × 0.1 ppm  (Table 4/8)
+//  Must be switched to Q&A mode on boot (default = initiative upload).
+// ─────────────────────────────────────────────────────────────
+#define CO_MULTIPLIER    0.1f
+#define CO_WARMUP_MS     180000UL    // 3 min  (datasheet: ≤3 min)
+
+// ─────────────────────────────────────────────────────────────
+//  ZE25A-O3
+//  0–2 ppm range, 1 ppb (0.001 ppm) per count
+// ─────────────────────────────────────────────────────────────
+#define O3_MULTIPLIER    0.001f
+#define O3_MAX_PPM       2.0f
+#define O3_WARMUP_MS     180000UL    // 3 min  (datasheet: ≤3 min)
+
+// ─────────────────────────────────────────────────────────────
+//  SEN0574 Fermion NO2 (GM-102B chip)
+//
+//  IMPORTANT LIMITATION (DFRobot wiki, confirmed):
+//    This sensor is rated for QUALITATIVE detection only.
+//    No factory ppm calibration curve exists for this part.
+//    The formula below is derived from the single spec datapoint:
+//      sensitivity R0/Rs(5ppm) ≤ 0.5  →  Rs(5ppm) ≥ 2×R0
+//    Individual units vary ±50%. Treat readings as indicative,
+//    not absolute. Values <1 ppm should be read as "near zero".
+//
+//  WHY 0.6 ppm APPEARED:
+//    With R0 ≈ 235 kΩ and RL = 4.7 kΩ, Vout_clean ≈ 65 mV.
+//    At ADC_11db (0–3.5 V, 4096 counts), that is only ~76 counts.
+//    The ESP32-S3 ADC has 30–40 count non-linearity at low signal.
+//    Each count ≈ 0.064 ppm, so 10 noisy counts = 0.6 ppm.
+//    SOLUTION: ADC_0db (0–0.75 V) → 65 mV = ~354 counts (4.6×).
+//    Also: dead-band clamps Rs/R0 < 1.08 to 0 ppm.
+//
+//  SETUP CHANGE REQUIRED — replace in setup():
+//    analogSetAttenuation(ADC_11db);   // OLD  ← remove this
+//    analogSetAttenuation(ADC_0db);    // NEW  ← add this
+//
+//  Physics:
+//    NO2 is an oxidizing gas → Rs INCREASES with concentration.
+//    Circuit: Vout = VCC × RL / (Rs + RL)
+//             Rs   = RL × (VCC − Vout) / Vout
+//    Formula: ppm  = (Rs/R0 − 1) × 5.0
+//      Check:  at 5 ppm, Rs/R0 ≥ 2.0 → (2−1)×5 = 5 ppm ✓
+//
+//  ADC_0db full-scale = 0.75 V on ESP32-S3.
+//  Sensor Vout at 10 ppm NO2 ≈ 22 mV (still within range).
+//  Sensor Vout at 0 ppm (clean air) ≈ 65 mV (within range).
+// ─────────────────────────────────────────────────────────────
+#define NO2_RL              4700.0f     // Ω   — confirmed on SEN0574 board
+#define NO2_VCC             3.3f        // V   — sensor supply
+#define NO2_R0_SEED         235508.0f   // Ω   — calibrated AC-room baseline
+#define NO2_SCALE           5.0f        // ppm/(Rs/R0 − 1)
+#define NO2_VOUT_MIN        0.01f       // V   — divide-by-zero guard
+#define NO2_PPM_MAX         10.0f       // ppm — SEN0574 detection range
+#define NO2_WARMUP_MS       300000UL    // 5 min  (datasheet: >5 min on power-on)
+#define NO2_ADC_FULLSCALE   0.75f       // V   — ESP32-S3 ADC_0db range
+#define NO2_DEADBAND_RATIO  1.08f       // Rs/R0 < 1.08 → 0 ppm (≈ 4× ADC non-linearity floor)
+
+// ─────────────────────────────────────────────────────────────
+//  Display layout  (400 × 300 px, 4.2" e-paper)
+// ─────────────────────────────────────────────────────────────
+#define ROW_Y0           92
+#define ROW_DY           38
+#define LABEL_X          12
+#define VALUE_RIGHT_X    375
+
+// ─────────────────────────────────────────────────────────────
+//  Objects
+// ─────────────────────────────────────────────────────────────
+SensirionI2cScd4x    scd4x;
+SensirionI2CSgp41    sgp41;
+VOCGasIndexAlgorithm vocAlgo;
+
+HardwareSerial coSerial(1);
+HardwareSerial o3Serial(2);
+
+GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
+    display(GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
+
+// ─────────────────────────────────────────────────────────────
+//  Global state
+// ─────────────────────────────────────────────────────────────
+float    g_tempC        = 25.0f;
+float    g_rhPct        = 50.0f;
+bool     g_sgpReady     = false;
+uint32_t g_sgpCondStart = 0;
+#define  SGP41_COND_MS  30000UL
+
+static float s_no2R0 = NO2_R0_SEED;
+
+// ═══════════════════════════════════════════════════════════════
+//  QUALITY LABEL HELPERS
+// ═══════════════════════════════════════════════════════════════
+static const char* qlf(float v, float good, float mod) {
+    if (v <  0.0f)  return "N/A";
+    if (v <  good)  return "Good";
+    if (v <  mod)   return "Mod";
+    return           "Poor";
+}
+static const char* qli(int v, int good, int mod) {
+    if (v <= 0)     return "N/A";
+    if (v <  good)  return "Good";
+    if (v <  mod)   return "Mod";
+    return           "Poor";
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FULL E-PAPER CLEAR
+// ═══════════════════════════════════════════════════════════════
+void fullClear() {
+    display.setFullWindow();
+    display.fillScreen(GxEPD_WHITE);
+    display.firstPage();
+    do {} while (display.nextPage());
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  WINSEN PROTOCOL HELPERS
+// ═══════════════════════════════════════════════════════════════
+static uint8_t winsenCRC(const uint8_t *b, uint8_t len) {
+    // NOT(sum of Bytes[1..len-2]) + 1  — ZE07-CO datasheet page 3
+    uint8_t s = 0;
+    for (uint8_t i = 1; i < len - 1; i++) s += b[i];
+    return (uint8_t)(~s + 1);
+}
+
+static bool winsenQuery(HardwareSerial &port, const uint8_t *req,
+                        uint8_t *rsp, uint8_t cmd, uint32_t tMs = 700) {
+    while (port.available()) port.read();  // flush stale bytes
+    port.write(req, 9);
+    uint32_t t0 = millis();
+    uint8_t  n  = 0;
+    while (millis() - t0 < tMs && n < 9)
+        if (port.available()) rsp[n++] = port.read();
+    return (n == 9 && rsp[0] == 0xFF && rsp[1] == cmd &&
+            rsp[8] == winsenCRC(rsp, 9));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ZE07-CO — switch to Q&A mode
+//  Command (Table 5): FF 01 78 41 00 00 00 00 46
+//  Must be called once on boot; default mode is initiative upload
+//  which causes winsenQuery to fail (Byte[1] = 0x04 not 0x86).
+// ═══════════════════════════════════════════════════════════════
+void setZE07_QAMode(HardwareSerial &port) {
+    static const uint8_t cmd[9] = {0xFF, 0x01, 0x78, 0x41,
+                                    0x00, 0x00, 0x00, 0x00, 0x46};
+    port.write(cmd, 9);
+    delay(500);
+    while (port.available()) port.read();  // flush echo
+    Serial.println("[CO] ZE07-CO switched to Q&A mode");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CO — ZE07-CO  (UART, Winsen Q&A mode)
+//  Frame (Table 8): FF 86 Hb Lb xx xx xx xx CRC
+//  ppm = (Hb×256 + Lb) × 0.1
+// ═══════════════════════════════════════════════════════════════
+float readCO_ppm() {
+    if (millis() < CO_WARMUP_MS) return -1.0f;
+
+    static const uint8_t req[9] = {0xFF, 0x01, 0x86, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t rsp[9] = {};
+    if (!winsenQuery(coSerial, req, rsp, 0x86)) {
+        Serial.println("[CO] Query failed — check wiring");
+        return -1.0f;
+    }
+
+    float ppm = (((uint16_t)rsp[2] << 8) | rsp[3]) * CO_MULTIPLIER;
+    Serial.printf("[CO] %.1f ppm (raw: %02X %02X)\n", ppm, rsp[2], rsp[3]);
+    return ppm;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  O3 — ZE25A-O3  (UART, Winsen Q&A mode)
+//  ZE25A: 0–2 ppm, 1 ppb resolution → × 0.001, clamped to 2.0 ppm
+// ═══════════════════════════════════════════════════════════════
+float readO3_ppm() {
+    if (millis() < O3_WARMUP_MS) return -1.0f;
+
+    static const uint8_t req[9] = {0xFF, 0x01, 0x86, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t rsp[9] = {};
+    if (!winsenQuery(o3Serial, req, rsp, 0x86)) return -1.0f;
+
+    float ppm = (((uint16_t)rsp[2] << 8) | rsp[3]) * O3_MULTIPLIER;
+    ppm = constrain(ppm, 0.0f, O3_MAX_PPM);
+    Serial.printf("[O3] %.3f ppm\n", ppm);
+    return ppm;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  NO2 — SEN0574 Fermion  (analog resistive MEMS, GM-102B chip)
+// ───────────────────────────────────────────────────────────────
+//  IMPORTANT LIMITATION (DFRobot wiki, confirmed):
+//    This sensor is rated for QUALITATIVE detection only.
+//    No factory ppm calibration curve exists for this part.
+//    The formula below is derived from the single spec datapoint:
+//      sensitivity R0/Rs(5ppm) ≤ 0.5  →  Rs(5ppm) ≥ 2×R0
+//    Individual units vary ±50%. Treat readings as indicative,
+//    not absolute. Values <1 ppm should be read as "near zero".
+//
+//  WHY 0.6 ppm APPEARED:
+//    With R0 ≈ 235 kΩ and RL = 4.7 kΩ, Vout_clean ≈ 65 mV.
+//    At ADC_11db (0–3.5 V, 4096 counts), that is only ~76 counts.
+//    The ESP32-S3 ADC has 30–40 count non-linearity at low signal.
+//    Each count ≈ 0.064 ppm, so 10 noisy counts = 0.6 ppm.
+//    SOLUTION: ADC_0db (0–0.75 V) → 65 mV = ~354 counts (4.6×).
+//    Also: dead-band clamps Rs/R0 < 1.08 to 0 ppm.
+//
+//  SETUP CHANGE REQUIRED — replace in setup():
+//    analogSetAttenuation(ADC_11db);   // OLD  ← remove this
+//    analogSetAttenuation(ADC_0db);    // NEW  ← add this
+//
+//  Physics:
+//    NO2 is an oxidizing gas → Rs INCREASES with concentration.
+//    Circuit: Vout = VCC × RL / (Rs + RL)
+//             Rs   = RL × (VCC − Vout) / Vout
+//    Formula: ppm  = (Rs/R0 − 1) × 5.0
+//      Check:  at 5 ppm, Rs/R0 ≥ 2.0 → (2−1)×5 = 5 ppm ✓
+//
+//  ADC_0db full-scale = 0.75 V on ESP32-S3.
+//  Sensor Vout at 10 ppm NO2 ≈ 22 mV (still within range).
+//  Sensor Vout at 0 ppm (clean air) ≈ 65 mV (within range).
+// ═══════════════════════════════════════════════════════════════
+float readNO2_ppm() {
+    if (millis() < NO2_WARMUP_MS) return -1.0f;
+
+    // ── ADC: 256 samples, sorted trim-mean (discard top+bottom 32) ──
+    // Larger N improves noise floor by √(256/128) = 1.41× over prev.
+    const int N_SAMP = 256;
+    const int N_TRIM = 32;
+    static int32_t s[N_SAMP];
+
+    for (int i = 0; i < N_SAMP; i++) {
+        s[i] = analogRead(PIN_NO2_ADC);
+        delayMicroseconds(300);
+    }
+
+    // Insertion sort
+    for (int i = 1; i < N_SAMP; i++) {
+        int32_t key = s[i];
+        int     j   = i - 1;
+        while (j >= 0 && s[j] > key) { s[j + 1] = s[j]; j--; }
+        s[j + 1] = key;
+    }
+
+    int64_t acc = 0;
+    int     cnt = N_SAMP - 2 * N_TRIM;
+    for (int i = N_TRIM; i < N_SAMP - N_TRIM; i++) acc += s[i];
+    float vout = (acc / (float)cnt) * (NO2_ADC_FULLSCALE / 4095.0f);
+
+    if (vout < NO2_VOUT_MIN) {
+        Serial.println("[NO2] ERROR: Vout < 10 mV — check wiring");
+        return -1.0f;
+    }
+
+    float Rs = NO2_RL * (NO2_VCC - vout) / vout;
+
+    // ── R0 state ──
+    static uint32_t calStart    = 0;
+    static bool     firstSample = true;
+
+    if (calStart == 0) {
+        calStart = millis();
+        Serial.printf("[NO2] Starting. R0_seed=%.0fΩ  Vout=%.4fV  "
+                      "ADC range=0db (0-0.75V)\n", s_no2R0, vout);
+    }
+    uint32_t elapsedMs  = millis() - calStart;
+    int      elapsedMin = (int)(elapsedMs / 60000UL);
+
+    // ── R0 update: hard-init on first sample, slow-track minimum ──
+    if (elapsedMs >= NO2_WARMUP_MS) {
+        if (firstSample) {
+            s_no2R0     = Rs;
+            firstSample = false;
+            Serial.printf("[NO2] R0 init: %.0f Ω  (Vout=%.4fV)\n",
+                          s_no2R0, vout);
+        } else if (Rs < s_no2R0) {
+            // Very gentle tracking: 1-hour time constant at 10s loop
+            // τ = 3600s, dt = 10s, α = dt/τ = 0.0028 ≈ 0.003
+            s_no2R0 = Rs * 0.003f + s_no2R0 * 0.997f;
+        }
+    }
+
+    // ── ppm with dead-band ──
+    float ratio   = Rs / s_no2R0;
+    float raw_ppm;
+
+    if (ratio < NO2_DEADBAND_RATIO) {
+        // Rs/R0 < 1.08: within ADC noise floor, clamp to zero.
+        // At ADC_0db, non-linearity ≈ 10 counts → ~0.024V → Rs error
+        // ≈ 3% → ratio error ≈ 0.03 → ppm error ≈ 0.15 ppm worst case.
+        // Deadband of 0.08 = 5× that margin.
+        raw_ppm = 0.0f;
+    } else {
+        raw_ppm = (ratio - 1.0f) * NO2_SCALE;
+    }
+    raw_ppm = constrain(raw_ppm, 0.0f, NO2_PPM_MAX);
+
+    // EMA: seed on first real value, 0.20 weight (5-reading settling)
+    static float ema_ppm = -1.0f;
+    if (ema_ppm < 0.0f) {
+        ema_ppm = raw_ppm;
+    } else {
+        ema_ppm = ema_ppm * 0.80f + raw_ppm * 0.20f;
+    }
+
+    Serial.printf("[NO2] Vout=%.4fV  Rs=%.0fΩ  R0=%.0fΩ  "
+                  "ratio=%.4f  raw=%.3f  ema=%.3f ppm  | %d min\n",
+                  vout, Rs, s_no2R0, ratio, raw_ppm, ema_ppm, elapsedMin);
+
+    // Calibration complete banner (only useful if recalibrating)
+    static bool r0Shown = false;
+    if (elapsedMs > 1800000UL && !r0Shown) {
+        Serial.printf("\n[NO2] Stable R0=%.0f Ω  →  update NO2_R0_SEED\n\n",
+                      s_no2R0);
+        r0Shown = true;
+    }
+
+    return ema_ppm;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  STATIC DISPLAY LAYOUT
+// ═══════════════════════════════════════════════════════════════
+void drawStaticLayout() {
+    display.setRotation(0);
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+
+        // Title — 18pt, drawn twice for subtle boldness
+        display.setFont(&FreeMonoBold18pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        const char  *T = "AIR QUALITY MONITOR";
+        int16_t  bx, by; uint16_t bw, bh;
+        display.getTextBounds(T, 0, 0, &bx, &by, &bw, &bh);
+        int16_t titleY = 35;
+        display.setCursor((display.width() - bw) / 2 - bx - 1, titleY);
+        display.print(T);
+        display.setCursor((display.width() - bw) / 2 - bx, titleY);
+        display.print(T);
+
+        // Row labels — 12pt
+        display.setFont(&FreeMonoBold12pt7b);
+        static const char *labels[] = {
+            "CO2  :", "T/RH :", "VOC  :",
+            "CO   :", "O3   :", "NO2  :"
+        };
+        for (int i = 0; i < 6; i++) {
+            display.setCursor(LABEL_X, ROW_Y0 + i * ROW_DY);
+            display.print(labels[i]);
+        }
+    } while (display.nextPage());
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  RIGHT-ALIGNED VALUE RENDERER
+// ═══════════════════════════════════════════════════════════════
+void printRightAligned(int y, const char *str) {
+    int16_t bx, by; uint16_t bw, bh;
+    display.getTextBounds(str, 0, 0, &bx, &by, &bw, &bh);
+    display.setCursor(VALUE_RIGHT_X - bw - bx, y);
+    display.print(str);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PARTIAL DISPLAY UPDATE — value column only
+// ═══════════════════════════════════════════════════════════════
+void updateValues(uint16_t co2, float temp, float rh,
+                  int32_t voc, float co, float o3, float no2) {
+    char buf[64];
+    const uint16_t valX = LABEL_X + 110;
+    const uint16_t valW = display.width() - valX;
+
+    display.setPartialWindow(valX, ROW_Y0 - 22, valW, ROW_DY * 6 + 48);
+    display.firstPage();
+    do {
+        display.fillRect(valX, ROW_Y0 - 22, valW, ROW_DY * 6 + 48, GxEPD_WHITE);
+        display.setFont(&FreeMonoBold12pt7b);
+        display.setTextColor(GxEPD_BLACK);
+
+        int y = ROW_Y0;
+
+        // CO2
+        if (co2 <= 0) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
+        else          snprintf(buf, sizeof(buf), "%5d ppm [%s]", co2, qli(co2, CO2_GOOD, CO2_MOD));
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // Temperature / Humidity
+        snprintf(buf, sizeof(buf), "%+5.1fC   %4.1f%%", temp, rh);
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // VOC index
+        if (voc <= 0) snprintf(buf, sizeof(buf), "  ---- idx [N/A]");
+        else          snprintf(buf, sizeof(buf), "%5d idx [%s]", (int)voc, qli(voc, VOC_GOOD, VOC_MOD));
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // CO
+        if (co < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
+        else           snprintf(buf, sizeof(buf), "%5.1f ppm [%s]", co, qlf(co, CO_GOOD, CO_MOD));
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // O3
+        if (o3 < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
+        else           snprintf(buf, sizeof(buf), "%6.3f ppm [%s]", o3, qlf(o3, O3_GOOD, O3_MOD));
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // NO2
+        if (no2 < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
+        else            snprintf(buf, sizeof(buf), "%5.3f ppm [%s]", no2, qlf(no2, NO2_GOOD, NO2_MOD));
+        printRightAligned(y, buf);
+
+    } while (display.nextPage());
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(115200);
+
+    // Wait for UART0 to be ready. 3 s timeout so the device boots
+    // normally when no serial monitor is attached.
+    {
+        uint32_t t0 = millis();
+        while (!Serial && (millis() - t0 < 3000)) delay(10);
+        delay(100);
+    }
+
+    Serial.println("=== AQM booting ===");
+    Serial.printf( "NO2: R0_seed=%.0f Ω, warmup=5 min, scale=%.1f\n",
+                   (float)NO2_R0_SEED, (float)NO2_SCALE);
+    Serial.println("CO : Q&A mode enforced on boot, ×0.1 ppm/count");
+    Serial.println("O3 : ×0.001 ppm/count (ZE25A, 0–2 ppm range)");
+
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+    Wire.setClock(100000);
+
+    // UART sensors
+    coSerial.begin(9600, SERIAL_8N1, PIN_CO_RX, PIN_CO_TX);
+    delay(100);
+    setZE07_QAMode(coSerial);
+
+    o3Serial.begin(9600, SERIAL_8N1, PIN_O3_RX, PIN_O3_TX);
+
+    // ADC
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_0db);   // NEW: 0–0.75 V range for NO2 (critical fix)
+
+    // I2C sensors
+    scd4x.begin(Wire, ADDR_SCD4X);
+    scd4x.stopPeriodicMeasurement();
+    delay(500);
+    scd4x.startPeriodicMeasurement();
+
+    sgp41.begin(Wire);
+    g_sgpCondStart = millis();
+
+    // E-paper
+    SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+    display.init(115200, true, 2, false);
+    fullClear(); delay(800);
+    fullClear(); delay(500);
+    drawStaticLayout();
+
+    Serial.println("Boot complete. Sensors warming up.");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════
+void loop() {
+    static uint32_t lastSgpMs  = 0;
+    static uint32_t lastCondMs = 0;
+    static uint32_t lastDispMs = 0;
+
+    static uint16_t lastCO2  = 0;
+    static float    lastTemp = 25.0f, lastRH = 50.0f;
+    static int32_t  lastVOC  = 0;
+    static float    lastCO   = -1.0f, lastO3 = -1.0f, lastNO2 = -1.0f;
+
+    // SGP41: 30 s conditioning, then 1 Hz measurement
+    if (!g_sgpReady) {
+        if (millis() - lastCondMs >= 1000) {
+            lastCondMs = millis();
+            uint16_t dummy;
+            sgp41.executeConditioning(0x8000, 0x6666, dummy);
+        }
+        if (millis() - g_sgpCondStart >= SGP41_COND_MS)
+            g_sgpReady = true;
+    }
+
+    if (g_sgpReady && millis() - lastSgpMs >= 1000) {
+        lastSgpMs = millis();
+        uint16_t compRH = (uint16_t)(g_rhPct  * 65535.0f / 100.0f);
+        uint16_t compT  = (uint16_t)((g_tempC + 45.0f) * 65535.0f / 175.0f);
+        uint16_t rawVoc = 0, rawNox = 0;
+        if (sgp41.measureRawSignals(compRH, compT, rawVoc, rawNox) == 0)
+            lastVOC = vocAlgo.process(rawVoc);
+    }
+
+    // Display + slow sensors — refresh every 10 s
+    if (millis() - lastDispMs >= 10000) {
+        lastDispMs = millis();
+
+        // SCD4x — CO2, temperature, humidity
+        bool rdy = false;
+        scd4x.getDataReadyStatus(rdy);
+        if (rdy) {
+            uint16_t co2 = 0; float t = 0, h = 0;
+            if (scd4x.readMeasurement(co2, t, h) == 0 && co2 != 0) {
+                lastCO2 = co2; lastTemp = t; lastRH = h;
+                g_tempC = t;   g_rhPct  = h;
+            }
+        }
+
+        lastCO  = readCO_ppm();
+        lastO3  = readO3_ppm();
+        lastNO2 = readNO2_ppm();
+
+        updateValues(lastCO2, lastTemp, lastRH, lastVOC,
+                     lastCO, lastO3, lastNO2);
+    }
+}
+this  is my  snesor code updae only snesores  related things other wifi and device conenction maintaian same whatre the vlaues showing display shwoing smae in my dashbaord update accordely okay also db  and all  thes  e things 
