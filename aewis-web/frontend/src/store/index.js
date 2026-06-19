@@ -19,6 +19,8 @@ const useStore = create((set, get) => ({
 
   // Devices
   devices: [],
+  isDevicesLoading: true,
+  setIsDevicesLoading: (loading) => set({ isDevicesLoading: loading }),
   selectedDeviceId: localStorage.getItem('selectedDeviceId') || null,
   setDevices: (devices) => {
     set({ devices });
@@ -32,10 +34,10 @@ const useStore = create((set, get) => ({
     localStorage.setItem('selectedDeviceId', deviceId);
     set({ selectedDeviceId: deviceId });
   },
-  updateDeviceStatus: (deviceId, status) =>
+  updateDeviceStatus: (deviceId, status, lastSeen) =>
     set((state) => ({
       devices: state.devices.map((d) =>
-        d.id === deviceId ? { ...d, status } : d
+        d.id === deviceId ? { ...d, status, ...(lastSeen ? { lastSeen } : {}) } : d
       ),
     })),
 

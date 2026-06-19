@@ -9,6 +9,7 @@ import Settings from './pages/Settings';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import NavBar from './components/NavBar';
+import ErrorBoundary from './components/ErrorBoundary';
 
 function RequireAuth({ children }) {
   const token = useStore((s) => s.token);
@@ -28,18 +29,20 @@ function Layout({ children }) {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
-        <Route path="/" element={<RequireAuth><Layout><Dashboard /></Layout></RequireAuth>} />
-        <Route path="/gas/:gasKey" element={<RequireAuth><Layout><GasDetail /></Layout></RequireAuth>} />
-        <Route path="/history" element={<RequireAuth><Layout><History /></Layout></RequireAuth>} />
-        <Route path="/alerts" element={<RequireAuth><Layout><Alerts /></Layout></RequireAuth>} />
-        <Route path="/devices" element={<RequireAuth><Layout><Devices /></Layout></RequireAuth>} />
-        <Route path="/settings" element={<RequireAuth><Layout><Settings /></Layout></RequireAuth>} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/" element={<RequireAuth><Layout><Dashboard /></Layout></RequireAuth>} />
+          <Route path="/gas/:gasKey" element={<RequireAuth><Layout><GasDetail /></Layout></RequireAuth>} />
+          <Route path="/history" element={<RequireAuth><Layout><History /></Layout></RequireAuth>} />
+          <Route path="/alerts" element={<RequireAuth><Layout><Alerts /></Layout></RequireAuth>} />
+          <Route path="/devices" element={<RequireAuth><Layout><Devices /></Layout></RequireAuth>} />
+          <Route path="/settings" element={<RequireAuth><Layout><Settings /></Layout></RequireAuth>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

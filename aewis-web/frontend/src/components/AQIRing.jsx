@@ -15,7 +15,7 @@ export default function AQIRing({ aqi, size = 160 }) {
     <div className="flex flex-col items-center gap-1" style={{ width: size }}>
       <svg viewBox="0 0 140 140" width={size} height={size}>
         {/* Background ring */}
-        <circle cx={cx} cy={cy} r={R} fill="none" stroke="#1F2937" strokeWidth="12" />
+        <circle cx={cx} cy={cy} r={R} fill="none" className="stroke-gray-200 dark:stroke-gray-800 transition-colors duration-300" strokeWidth="12" />
         {/* Value ring */}
         <circle
           cx={cx} cy={cy} r={R}
@@ -29,12 +29,12 @@ export default function AQIRing({ aqi, size = 160 }) {
           style={{ transition: 'stroke-dashoffset 0.5s ease, stroke 0.5s ease' }}
         />
         {/* AQI number */}
-        <text x={cx} y={cy - 8} textAnchor="middle"
-          style={{ fontSize: '32px', fontWeight: 700, fill: '#F9FAFB', fontFamily: 'monospace' }}>
+        <text x={cx} y={cy - 8} textAnchor="middle" className="fill-gray-900 dark:fill-white font-mono"
+          style={{ fontSize: '32px', fontWeight: 700, fontFamily: 'monospace' }}>
           {aqi ?? '—'}
         </text>
-        <text x={cx} y={cy + 14} textAnchor="middle"
-          style={{ fontSize: '10px', fill: '#9CA3AF' }}>
+        <text x={cx} y={cy + 14} textAnchor="middle" className="fill-gray-500 dark:fill-gray-400"
+          style={{ fontSize: '10px' }}>
           AQI
         </text>
       </svg>

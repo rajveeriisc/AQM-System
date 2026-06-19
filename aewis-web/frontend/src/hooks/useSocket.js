@@ -11,6 +11,7 @@ export function getSocket() {
       autoConnect: false,
       reconnectionAttempts: 10,
       reconnectionDelay: 1000,
+      auth: { token: useStore.getState().token },
     });
   }
   return socket;
@@ -36,7 +37,7 @@ export function useSocket() {
     };
     const onAlertNew = (alert) => addAlert(alert);
     const onAlertResolved = ({ alertId }) => resolveAlert(alertId);
-    const onDeviceStatus = ({ deviceId, status }) => updateDeviceStatus(deviceId, status);
+    const onDeviceStatus = ({ deviceId, status, lastSeen }) => updateDeviceStatus(deviceId, status, lastSeen);
 
     sock.on('sensor:update', onSensorUpdate);
     sock.on('alert:new', onAlertNew);

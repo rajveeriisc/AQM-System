@@ -23,6 +23,8 @@ export function useDevice() {
       }
     } catch (err) {
       console.error('fetchDevices error:', err);
+    } finally {
+      useStore.getState().setIsDevicesLoading(false);
     }
   }, [setDevices, setLiveReading]);
 

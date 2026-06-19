@@ -9,7 +9,7 @@ import AQIRing from '../components/AQIRing';
 import TrendChart from '../components/TrendChart';
 import AlertBanner from '../components/AlertBanner';
 import DeviceStatus from '../components/DeviceStatus';
-import { GAS_KEYS } from '../utils/thresholds';
+import { GAS_KEYS, GAS_META } from '../utils/thresholds';
 import { fmt, fmtTime } from '../utils/formatters';
 import client from '../api/client';
 
@@ -20,6 +20,7 @@ export default function Dashboard() {
   const liveReading = useStore((s) => s.liveReading);
   const readingHistory = useStore((s) => s.readingHistory);
   const devices = useStore((s) => s.devices);
+  const isDevicesLoading = useStore((s) => s.isDevicesLoading);
   const selectedDeviceId = useStore((s) => s.selectedDeviceId);
   const selectDevice = useStore((s) => s.selectDevice);
   const tempUnit = useStore((s) => s.tempUnit);
@@ -56,17 +57,25 @@ export default function Dashboard() {
       : `${temp.toFixed(1)}°C`
     : '—';
 
+  if (isDevicesLoading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 dark:bg-gray-950 transition-colors duration-300">
+        <div className="w-10 h-10 border-4 border-gray-200 dark:border-gray-800 border-t-blue-600 dark:border-t-blue-500 rounded-full animate-spin flex-shrink-0"></div>
+      </div>
+    );
+  }
+
   if (devices.length === 0) {
     return (
-      <div className="min-h-screen bg-gray-950 text-white flex flex-col items-center justify-center gap-4 px-4">
-        <div className="text-5xl">📡</div>
-        <h2 className="text-xl font-bold text-white">No devices linked</h2>
-        <p className="text-sm text-gray-400 text-center max-w-xs">
-          Go to <strong>Devices</strong> and add your AEWIS monitor using the 6-digit pairing code.
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 px-4 transition-colors duration-300">
+        <div className="text-6xl drop-shadow-lg">📡</div>
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-white">No devices linked</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center max-w-xs">
+          Go to <strong>Devices</strong> and add your AQM Systems monitor using the 6-digit pairing code.
         </p>
         <Link
           to="/devices"
-          className="mt-2 px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-lg transition-colors"
+          className="mt-4 px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white shadow-md hover:shadow-lg text-sm font-semibold rounded-xl transition-all duration-300"
         >
           Add Device
         </Link>
@@ -75,19 +84,19 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white">
+    <div className="min-h-screen transition-colors duration-300">
       {/* Top bar */}
-      <header className="flex items-center justify-between px-6 py-3 bg-gray-900 border-b border-gray-800 sticky top-0 z-10">
+      <header className="flex items-center justify-between px-6 py-4 bg-white/60 dark:bg-gray-900/60 backdrop-blur-xl border-b border-gray-200 dark:border-gray-800 sticky top-0 z-10 transition-colors duration-300">
         <div className="flex items-center gap-3">
-          <span className="text-xl font-bold tracking-tight text-white">AEWIS</span>
-          <span className="text-xs bg-green-900/50 text-green-400 border border-green-700 px-2 py-0.5 rounded font-mono">LIVE</span>
+          <span className="text-2xl font-bold tracking-tight text-gray-900 dark:text-white drop-shadow-sm">AQM Systems</span>
+          <span className="text-xs bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-400 border border-green-200 dark:border-green-700/50 px-2.5 py-0.5 rounded-full font-mono font-medium shadow-sm">LIVE</span>
         </div>
 
         {/* Device selector */}
         <select
           value={selectedDeviceId || ''}
           onChange={(e) => selectDevice(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none"
+          className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl px-4 py-2 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 shadow-sm transition-all duration-300"
         >
           {devices.map((d) => (
             <option key={d.id} value={d.id}>
@@ -96,7 +105,7 @@ export default function Dashboard() {
           ))}
         </select>
 
-        <span className="font-mono text-sm text-gray-400">{now.toLocaleTimeString()}</span>
+        <span className="font-mono text-sm text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800/50 px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700/50">{now.toLocaleTimeString()}</span>
       </header>
 
       <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
@@ -116,7 +125,10 @@ export default function Dashboard() {
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-1">
               <StatCard label="Temperature" value={displayTemp} />
               <StatCard label="Humidity" value={liveReading?.rh != null ? `${fmt(liveReading.rh, 1)}%` : '—'} />
-              <StatCard label="Primary Pollutant" value={liveReading?.primaryPollutant?.toUpperCase() || '—'} />
+              <StatCard 
+                label="Primary Pollutant" 
+                value={liveReading?.primaryPollutant && GAS_META[liveReading.primaryPollutant] ? GAS_META[liveReading.primaryPollutant].label : '—'} 
+              />
               <StatCard label="Readings Today" value={stats?.count ?? '—'} />
               <StatCard label={`${timeRange} Avg AQI`} value={stats?.aqi?.avg != null ? Math.round(stats.aqi.avg) : '—'} />
               <StatCard label="Last Update" value={liveReading?.ts ? fmtTime(liveReading.ts) : '—'} />
@@ -127,7 +139,7 @@ export default function Dashboard() {
         {/* Gas gauges */}
         <section>
           <h2 className="text-xs uppercase tracking-widest text-gray-500 mb-3">Real-Time Gas Monitor — All Channels</h2>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             {GAS_KEYS.map((key) => (
               <GasGauge
                 key={key}
@@ -140,15 +152,15 @@ export default function Dashboard() {
         </section>
 
         {/* Trend chart */}
-        <section className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xs uppercase tracking-widest text-gray-500">Trend — All Gases Normalised</h2>
+        <section className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-sm transition-colors duration-300">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500 dark:text-gray-400">Trend — All Gases Normalised</h2>
             <div className="flex gap-1">
               {TIME_RANGES.map((r) => (
                 <button
                   key={r}
                   onClick={() => setTimeRange(r)}
-                  className={`px-3 py-1 text-xs rounded ${timeRange === r ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                  className={`px-4 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${timeRange === r ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700'}`}
                 >
                   {r}
                 </button>
@@ -164,9 +176,9 @@ export default function Dashboard() {
 
 function StatCard({ label, value }) {
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-3">
-      <p className="text-xs text-gray-500">{label}</p>
-      <p className="text-lg font-mono font-bold text-white mt-0.5">{value}</p>
+    <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl p-4 shadow-sm hover:shadow-md transition-all duration-300">
+      <p className="text-xs font-medium text-gray-500 dark:text-gray-400">{label}</p>
+      <p className="text-xl font-mono font-bold text-gray-900 dark:text-white mt-1 drop-shadow-sm">{value}</p>
     </div>
   );
 }

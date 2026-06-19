@@ -36,14 +36,14 @@ export default function GasGauge({ gasKey, value, history = [] }) {
 
   return (
     <div
-      className="bg-gray-900 border border-gray-700 rounded-xl p-4 cursor-pointer hover:border-gray-500 transition-colors flex flex-col gap-2"
+      className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-4 cursor-pointer hover:shadow-md hover:border-blue-400 dark:hover:border-gray-600 transition-all duration-300 flex flex-col gap-2 group"
       onClick={() => navigate(`/gas/${gasKey}`)}
     >
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{meta.label}</span>
-          <span className="ml-2 text-xs text-gray-600">{meta.chip}</span>
+          <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{meta.label}</span>
+          <span className="ml-2 text-xs text-gray-400 dark:text-gray-600">{meta.chip}</span>
         </div>
         <span
           className="text-xs font-bold px-2 py-0.5 rounded"
@@ -54,19 +54,19 @@ export default function GasGauge({ gasKey, value, history = [] }) {
       </div>
 
       {/* SVG Gauge */}
-      <div className="flex justify-center">
+      <div className="flex justify-center relative scale-100 group-hover:scale-105 transition-transform duration-300">
         <svg viewBox="0 0 100 60" className="w-32 h-20">
           {/* Background arc */}
-          <path d={bgPath} fill="none" stroke="#1F2937" strokeWidth="8" strokeLinecap="round" />
+          <path d={bgPath} fill="none" className="stroke-gray-200 dark:stroke-gray-800" strokeWidth="8" strokeLinecap="round" />
           {/* Value arc */}
           {value != null && (
             <path d={arcPath} fill="none" stroke={status.color} strokeWidth="8" strokeLinecap="round" />
           )}
           {/* Value text */}
-          <text x={cx} y={cy - 2} textAnchor="middle" className="font-mono" style={{ fontSize: '14px', fill: '#F9FAFB', fontWeight: 700, fontFamily: 'monospace' }}>
+          <text x={cx} y={cy - 2} textAnchor="middle" className="font-mono fill-gray-900 dark:fill-white" style={{ fontSize: '14px', fontWeight: 700, fontFamily: 'monospace' }}>
             {fmt(value, (gasKey === 'o3' || gasKey === 'no2') ? 3 : (gasKey === 'voc' || gasKey === 'co2') ? 0 : 1)}
           </text>
-          <text x={cx} y={cy + 10} textAnchor="middle" style={{ fontSize: '7px', fill: '#9CA3AF' }}>
+          <text x={cx} y={cy + 10} textAnchor="middle" className="fill-gray-500 dark:fill-gray-400" style={{ fontSize: '7px' }}>
             {meta.unit}
           </text>
         </svg>
@@ -74,9 +74,6 @@ export default function GasGauge({ gasKey, value, history = [] }) {
 
       {/* Sparkline */}
       <SparkLine data={sparkData} color={status.color} />
-
-      {/* Status text */}
-      <p className="text-xs text-center" style={{ color: status.color }}>{status.level}</p>
     </div>
   );
 }

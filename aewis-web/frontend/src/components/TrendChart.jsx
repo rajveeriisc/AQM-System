@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Chart, registerables } from 'chart.js';
 import { GAS_META, GAS_KEYS } from '../utils/thresholds';
+import useStore from '../store';
 
 Chart.register(...registerables);
 
@@ -16,6 +17,8 @@ const GAS_COLORS = {
 export default function TrendChart({ history = [], timeRange = '1H', gasKey = null }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
+  const theme = useStore((s) => s.theme);
+  const isDark = theme === 'dark';
   const [hiddenGases, setHiddenGases] = useState({});
 
   const keys = gasKey ? [gasKey] : GAS_KEYS;
@@ -54,6 +57,12 @@ export default function TrendChart({ history = [], timeRange = '1H', gasKey = nu
     if (chartRef.current) {
       chartRef.current.data.labels = labels;
       chartRef.current.data.datasets = datasets;
+      // Update theme colors dynamically
+      chartRef.current.options.plugins.legend.labels.color = isDark ? '#9CA3AF' : '#6B7280';
+      chartRef.current.options.scales.x.ticks.color = isDark ? '#6B7280' : '#9CA3AF';
+      chartRef.current.options.scales.x.grid.color = isDark ? '#1F2937' : '#E5E7EB';
+      chartRef.current.options.scales.y.ticks.color = isDark ? '#6B7280' : '#9CA3AF';
+      chartRef.current.options.scales.y.grid.color = isDark ? '#1F2937' : '#E5E7EB';
       chartRef.current.update('none');
       return;
     }
@@ -70,7 +79,7 @@ export default function TrendChart({ history = [], timeRange = '1H', gasKey = nu
           legend: {
             display: !gasKey,
             position: 'top',
-            labels: { color: '#9CA3AF', boxWidth: 12, font: { size: 11 } },
+            labels: { color: isDark ? '#9CA3AF' : '#6B7280', boxWidth: 12, font: { size: 11 } },
             onClick(e, legendItem, legend) {
               const key = keys[legendItem.datasetIndex];
               setHiddenGases((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -79,6 +88,12 @@ export default function TrendChart({ history = [], timeRange = '1H', gasKey = nu
             },
           },
           tooltip: {
+            backgroundColor: isDark ? 'rgba(17, 24, 39, 0.9)' : 'rgba(255, 255, 255, 0.9)',
+            titleColor: isDark ? '#F9FAFB' : '#111827',
+            bodyColor: isDark ? '#D1D5DB' : '#374151',
+            borderColor: isDark ? '#374151' : '#E5E7EB',
+            borderWidth: 1,
+            padding: 12,
             callbacks: {
               label: (ctx) => {
                 const key = keys[ctx.datasetIndex];
@@ -93,12 +108,12 @@ export default function TrendChart({ history = [], timeRange = '1H', gasKey = nu
         },
         scales: {
           x: {
-            ticks: { color: '#6B7280', maxTicksLimit: 8, font: { size: 10 } },
-            grid: { color: '#1F2937' },
+            ticks: { color: isDark ? '#6B7280' : '#9CA3AF', maxTicksLimit: 8, font: { size: 10 } },
+            grid: { color: isDark ? '#1F2937' : '#E5E7EB' },
           },
           y: {
-            ticks: { color: '#6B7280', font: { size: 10 } },
-            grid: { color: '#1F2937' },
+            ticks: { color: isDark ? '#6B7280' : '#9CA3AF', font: { size: 10 } },
+            grid: { color: isDark ? '#1F2937' : '#E5E7EB' },
             ...(gasKey
               ? {}
               : {
@@ -116,7 +131,7 @@ export default function TrendChart({ history = [], timeRange = '1H', gasKey = nu
     }
 
     return () => {};
-  }, [history, gasKey]);
+  }, [history, gasKey, isDark]);
 
   useEffect(() => {
     return () => {

@@ -2,9 +2,11 @@ require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 
-const { initSchema } = require('./services/db');
-const { init: initSocket } = require('./socket/emitter');
+const { initSchema, query } = require('./services/db');
+const { init: initSocket, emitDeviceStatus } = require('./socket/emitter');
 const { start: startMqtt } = require('./mqtt/subscriber');
 const { apiLimiter } = require('./middleware/rateLimit');
 
@@ -21,6 +23,8 @@ const server = http.createServer(app);
 app.set('trust proxy', 1);
 
 // Middleware
+app.use(helmet());
+app.use(compression());
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
@@ -58,6 +62,23 @@ async function start() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`AEWIS API running on port ${PORT}`);
     });
+
+    // Mark devices offline if no reading received in 45 s
+    setInterval(async () => {
+      try {
+        const { rows } = await query(
+          `UPDATE devices SET status = 'offline'
+           WHERE status = 'online' AND last_seen < NOW() - INTERVAL '45 seconds'
+           RETURNING id, last_seen`
+        );
+        for (const d of rows) {
+          emitDeviceStatus(d.id, 'offline', d.last_seen);
+          console.log(`[watchdog] ${d.id} → offline`);
+        }
+      } catch (err) {
+        console.error('[watchdog]', err.message);
+      }
+    }, 30_000);
   } catch (err) {
     console.error('Failed to start server:', err);
     process.exit(1);

@@ -6,7 +6,7 @@ const { validateQuery } = require('../middleware/validate');
 const { v4: uuidv4 } = require('uuid');
 const { calcAQI } = require('../services/aqiCalc');
 const { processReading } = require('../services/alertEngine');
-const { emitSensorUpdate } = require('../socket/emitter');
+const { emitSensorUpdate, emitDeviceStatus } = require('../socket/emitter');
 
 const router = express.Router();
 
@@ -31,11 +31,15 @@ function fmtReading(r) {
 router.post('/', async (req, res) => {
   const data = req.body;
   const deviceId = data.device_id;
+  const token = req.headers['x-device-token'];
+  
   if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+  if (!token) return res.status(401).json({ error: 'Device token required in x-device-token header' });
 
   try {
-    const { rows } = await query('SELECT id FROM devices WHERE id = $1', [deviceId]);
-    if (!rows.length) return res.status(404).json({ error: 'Device not found' });
+    const { rows } = await query('SELECT id, status FROM devices WHERE id = $1 AND provision_token = $2', [deviceId, token]);
+    if (!rows.length) return res.status(401).json({ error: 'Unauthorized or device not found' });
+    const wasOffline = rows[0].status !== 'online';
 
     const { aqi, primaryPollutant } = calcAQI(data);
     const readingId = uuidv4();
@@ -64,6 +68,7 @@ router.post('/', async (req, res) => {
 
     const readingObj = fmtReading(reading);
     emitSensorUpdate(deviceId, readingObj);
+    if (wasOffline) emitDeviceStatus(deviceId, 'online');
     await processReading(deviceId, readingObj, readingId);
 
     res.status(201).json(readingObj);
@@ -91,17 +96,18 @@ router.get('/latest', requireAuth, validateQuery(latestSchema), async (req, res)
   }
 });
 
-// GET /api/readings?deviceId=&from=&to=&interval=&limit=
+// GET /api/readings?deviceId=&from=&to=&interval=&limit=&offset=
 const readingsSchema = z.object({
   deviceId: z.string().min(1),
   from: z.string().datetime({ offset: true }).optional(),
   to: z.string().datetime({ offset: true }).optional(),
   interval: z.enum(['raw', '1min', '5min', '1hour']).default('raw'),
   limit: z.coerce.number().int().min(1).max(10000).default(500),
+  offset: z.coerce.number().int().min(0).default(0),
 });
 
 router.get('/', requireAuth, validateQuery(readingsSchema), async (req, res) => {
-  const { deviceId, from, to, interval, limit } = req.query;
+  const { deviceId, from, to, interval, limit, offset } = req.query;
   try {
     if (!await ownsDevice(req.user.userId, deviceId)) return res.status(403).json({ error: 'Forbidden' });
 
@@ -114,8 +120,9 @@ router.get('/', requireAuth, validateQuery(readingsSchema), async (req, res) => 
 
     if (interval === 'raw') {
       params.push(limit);
+      params.push(offset);
       const { rows } = await query(
-        `SELECT * FROM readings WHERE ${where} ORDER BY ts DESC LIMIT $${i}`,
+        `SELECT * FROM readings WHERE ${where} ORDER BY ts DESC LIMIT $${i} OFFSET $${i+1}`,
         params
       );
       return res.json(rows.map(fmtReading));

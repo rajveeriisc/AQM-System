@@ -84,14 +84,13 @@ export const GAS_META = {
 export const GAS_KEYS = ['co', 'no2', 'co2', 'o3', 'voc'];
 
 export function getStatus(pollutant, value) {
-  if (value == null) return { level: 'Unknown', color: '#6B7280', badge: 'UNKN' };
+  if (value == null || value < 0) return { level: 'Unknown', color: '#6B7280', badge: 'UNKN' };
   const meta = GAS_META[pollutant];
   if (!meta) return { level: 'Unknown', color: '#6B7280', badge: 'UNKN' };
 
-  if (value > meta.crit) return { level: 'Critical', color: '#EF4444', badge: 'CRIT' };
-  if (value > meta.warn) return { level: 'High', color: '#F97316', badge: 'HIGH' };
-  if (value > meta.warn * 0.6) return { level: 'Moderate', color: '#EAB308', badge: 'MOD' };
-  return { level: 'Good', color: '#22C55E', badge: 'GOOD' };
+  if (value < meta.warn) return { level: 'Good', color: '#22C55E', badge: 'GOOD' };
+  if (value < meta.crit) return { level: 'Moderate', color: '#EAB308', badge: 'MOD' };
+  return { level: 'Poor', color: '#EF4444', badge: 'POOR' };
 }
 
 export function aqiColor(aqi) {

@@ -1,55 +1,41 @@
-const { Aedes } = require('aedes');
-const net        = require('net');
+const mqtt = require('mqtt');
 
-let aedes     = null;
-let tcpServer = null;
+let client = null;
 
 function startBroker() {
-  aedes = new Aedes();
+  const url = process.env.MQTT_URL || 'mqtt://localhost:1883';
+  const username = process.env.MQTT_USER;
+  const password = process.env.MQTT_PASSWORD;
 
-  const port = parseInt(process.env.MQTT_PORT || '1883');
-  tcpServer = net.createServer(aedes.handle);
-
-  tcpServer.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`MQTT port ${port} already in use — stop Mosquitto or other MQTT broker first.`);
-      console.error('Run:  npx kill-port 1883   or stop the Mosquitto service.');
-    } else {
-      console.error('MQTT TCP server error:', err.message);
-    }
-    process.exit(1);
+  client = mqtt.connect(url, {
+    username,
+    password,
+    clientId: `aewis-backend-${Math.random().toString(16).slice(2, 8)}`,
   });
 
-  tcpServer.listen(port, '0.0.0.0', () => {
-    console.log(`MQTT broker (aedes) listening on port ${port}`);
+  client.on('connect', () => {
+    console.log(`Connected to external MQTT broker at ${url}`);
+    // Subscribe to all device readings, status, and provision topics
+    client.subscribe('aewis/devices/+/readings', { qos: 0 });
+    client.subscribe('aewis/devices/+/status', { qos: 0 });
+    client.subscribe('aewis/devices/+/provision', { qos: 0 });
   });
 
-  aedes.on('client', (client) => {
-    console.log(`MQTT client connected: ${client.id}`);
+  client.on('error', (err) => {
+    console.error('MQTT client error:', err.message);
   });
 
-  aedes.on('clientDisconnect', (client) => {
-    console.log(`MQTT client disconnected: ${client.id}`);
-  });
-
-  aedes.on('error', (err) => {
-    console.error('MQTT broker error:', err.message);
-  });
-
-  return aedes;
+  return client;
 }
 
 // Publish a command packet to a subscribed device (e.g. OTA, reset, wifi)
 function publish(topic, payload) {
-  if (!aedes) return false;
+  if (!client || !client.connected) return false;
   const msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
-  aedes.publish(
-    { cmd: 'publish', qos: 0, topic, payload: Buffer.from(msg), retain: false },
-    () => {}
-  );
+  client.publish(topic, msg, { qos: 0, retain: false });
   return true;
 }
 
-function getBroker() { return aedes; }
+function getBroker() { return client; }
 
 module.exports = { startBroker, getBroker, publish };

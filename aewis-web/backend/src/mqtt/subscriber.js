@@ -8,20 +8,19 @@ const { startBroker, getBroker, publish } = require('./broker');
 function start() {
   const broker = startBroker();
 
-  // Only handle messages from real clients (client === null means server-internal)
-  broker.on('publish', async (packet, client) => {
-    if (!client) return;
-
-    const topic   = packet.topic;
-    const payload = packet.payload.toString();
-
+  // Handle incoming messages from the external broker
+  broker.on('message', async (topic, payload) => {
     try {
+      const msgStr = payload.toString();
       const parts    = topic.split('/');
+      // Topic structure: aewis/devices/{deviceId}/{type}
+      if (parts[0] !== 'aewis' || parts[1] !== 'devices') return;
+      
       const deviceId = parts[2];
       const type     = parts[3];
       if (!deviceId || !type) return;
 
-      const data = JSON.parse(payload);
+      const data = JSON.parse(msgStr);
 
       if (type === 'status')    { await handleStatus(deviceId, data);    return; }
       if (type === 'provision') { await handleProvision(deviceId, data); return; }
