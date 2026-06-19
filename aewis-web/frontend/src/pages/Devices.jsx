@@ -1,14 +1,15 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useDevice } from '../hooks/useDevice';
+import { useSocket } from '../hooks/useSocket';
 import PairingModal from '../components/PairingModal';
 import DeviceStatus from '../components/DeviceStatus';
 import { aqiColor, aqiLabel } from '../utils/thresholds';
 import client from '../api/client';
-import { getSocket } from '../hooks/useSocket';
 
 export default function Devices() {
   const { devices, fetchDevices } = useDevice();
+  useSocket(); // enables real-time device:status updates on this page
   const [showPairing, setShowPairing] = useState(false);
   const [editDevice, setEditDevice] = useState(null);
   const [editForm, setEditForm] = useState({});

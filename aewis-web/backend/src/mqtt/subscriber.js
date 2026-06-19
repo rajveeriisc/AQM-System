@@ -15,12 +15,18 @@ function start() {
       const parts    = topic.split('/');
       // Topic structure: aewis/devices/{deviceId}/{type}
       if (parts[0] !== 'aewis' || parts[1] !== 'devices') return;
-      
+
       const deviceId = parts[2];
       const type     = parts[3];
       if (!deviceId || !type) return;
 
-      const data = JSON.parse(msgStr);
+      let data;
+      try {
+        data = JSON.parse(msgStr);
+      } catch (parseErr) {
+        console.error(`[MQTT] Invalid JSON on topic ${topic}:`, parseErr.message);
+        return;
+      }
 
       if (type === 'status')    { await handleStatus(deviceId, data);    return; }
       if (type === 'provision') { await handleProvision(deviceId, data); return; }
@@ -51,19 +57,29 @@ async function handleProvision(deviceId, data) {
 
 async function handleStatus(deviceId, data) {
   const status = data.status || 'online';
-  await query(
-    'UPDATE devices SET status = $1, last_seen = NOW() WHERE id = $2',
-    [status, deviceId]
-  );
-  emitDeviceStatus(deviceId, status);
+  // Only refresh last_seen on 'online' — offline LWT should preserve the last real timestamp
+  if (status === 'online') {
+    await query(
+      'UPDATE devices SET status = $1, last_seen = NOW() WHERE id = $2',
+      [status, deviceId]
+    );
+    emitDeviceStatus(deviceId, status);
+  } else {
+    const { rows: [d] } = await query(
+      'UPDATE devices SET status = $1 WHERE id = $2 RETURNING last_seen',
+      [status, deviceId]
+    );
+    emitDeviceStatus(deviceId, status, d?.last_seen ?? null);
+  }
 }
 
 async function handleReading(deviceId, data) {
-  const { rows } = await query('SELECT id FROM devices WHERE id = $1', [deviceId]);
+  const { rows } = await query('SELECT id, status FROM devices WHERE id = $1', [deviceId]);
   if (!rows.length) {
     console.warn(`MQTT reading for unknown device: ${deviceId}`);
     return;
   }
+  const wasOffline = rows[0].status !== 'online';
 
   const { aqi, primaryPollutant } = calcAQI(data);
   const readingId = uuidv4();
@@ -91,6 +107,7 @@ async function handleReading(deviceId, data) {
   );
 
   const readingObj = {
+    deviceId,
     id: reading.id, ts: reading.ts,
     pm25: reading.pm25, pm10: reading.pm10, pm1: reading.pm1,
     co: reading.co, no2: reading.no2, co2: reading.co2,
@@ -100,12 +117,15 @@ async function handleReading(deviceId, data) {
   };
 
   emitSensorUpdate(deviceId, readingObj);
+  if (wasOffline) emitDeviceStatus(deviceId, 'online');
   await processReading(deviceId, readingObj, readingId);
 }
 
 function stop() {
   const broker = getBroker();
-  if (broker) broker.close();
+  if (broker && broker.connected) {
+    broker.end(false, {}, () => console.log('[MQTT] Client disconnected cleanly'));
+  }
 }
 
 module.exports = { start, stop, publish };

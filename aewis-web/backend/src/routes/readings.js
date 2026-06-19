@@ -20,6 +20,7 @@ async function ownsDevice(userId, deviceId) {
 
 function fmtReading(r) {
   return {
+    deviceId: r.device_id,
     id: r.id, ts: r.ts,
     pm25: r.pm25, pm10: r.pm10, pm1: r.pm1,
     co: r.co, no2: r.no2, co2: r.co2, o3: r.o3, voc: r.voc,
@@ -178,6 +179,7 @@ router.get('/stats', requireAuth, validateQuery(statsSchema), async (req, res) =
 
     const { rows: [s] } = await query(
       `SELECT
+         MIN(pm1)  AS pm1_min,  MAX(pm1)  AS pm1_max,  AVG(pm1)  AS pm1_avg,
          MIN(pm25) AS pm25_min, MAX(pm25) AS pm25_max, AVG(pm25) AS pm25_avg,
          MIN(pm10) AS pm10_min, MAX(pm10) AS pm10_max, AVG(pm10) AS pm10_avg,
          MIN(co)   AS co_min,   MAX(co)   AS co_max,   AVG(co)   AS co_avg,
@@ -194,9 +196,9 @@ router.get('/stats', requireAuth, validateQuery(statsSchema), async (req, res) =
 
     const stat = (k) => ({ min: s[`${k}_min`], max: s[`${k}_max`], avg: s[`${k}_avg`] });
     res.json({
-      pm25: stat('pm25'), pm10: stat('pm10'), co: stat('co'),
-      no2: stat('no2'), co2: stat('co2'), o3: stat('o3'),
-      voc: stat('voc'), aqi: stat('aqi'),
+      pm1: stat('pm1'), pm25: stat('pm25'), pm10: stat('pm10'),
+      co: stat('co'), no2: stat('no2'), co2: stat('co2'),
+      o3: stat('o3'), voc: stat('voc'), aqi: stat('aqi'),
       count: parseInt(s.count),
     });
   } catch (err) {
@@ -247,7 +249,9 @@ router.get('/hourly', requireAuth, validateQuery(hourlySchema), async (req, res)
       `SELECT
          EXTRACT(HOUR FROM ts)::int AS hour,
          AVG(aqi)  AS avg_aqi,
+         AVG(pm1)  AS avg_pm1,
          AVG(pm25) AS avg_pm25,
+         AVG(pm10) AS avg_pm10,
          AVG(co)   AS avg_co,
          AVG(no2)  AS avg_no2,
          AVG(co2)  AS avg_co2,
@@ -263,10 +267,15 @@ router.get('/hourly', requireAuth, validateQuery(hourlySchema), async (req, res)
     );
     res.json(rows.map((r) => ({
       hour: r.hour,
-      avgAqi: parseFloat(r.avg_aqi), avgPm25: parseFloat(r.avg_pm25),
-      avgCo: parseFloat(r.avg_co), avgNo2: parseFloat(r.avg_no2),
-      avgCo2: parseFloat(r.avg_co2), avgO3: parseFloat(r.avg_o3),
-      avgVoc: parseFloat(r.avg_voc),
+      avgAqi: parseFloat(r.avg_aqi),
+      avgPm1: r.avg_pm1 != null ? parseFloat(r.avg_pm1) : null,
+      avgPm25: r.avg_pm25 != null ? parseFloat(r.avg_pm25) : null,
+      avgPm10: r.avg_pm10 != null ? parseFloat(r.avg_pm10) : null,
+      avgCo: r.avg_co != null ? parseFloat(r.avg_co) : null,
+      avgNo2: r.avg_no2 != null ? parseFloat(r.avg_no2) : null,
+      avgCo2: r.avg_co2 != null ? parseFloat(r.avg_co2) : null,
+      avgO3: r.avg_o3 != null ? parseFloat(r.avg_o3) : null,
+      avgVoc: r.avg_voc != null ? parseFloat(r.avg_voc) : null,
     })));
   } catch (err) {
     console.error(err);

@@ -6,12 +6,14 @@ import useStore from '../store';
 Chart.register(...registerables);
 
 const GAS_COLORS = {
+  pm1:  '#FB923C',
   pm25: '#F97316',
-  co: '#EF4444',
-  no2: '#A855F7',
-  co2: '#3B82F6',
-  o3: '#06B6D4',
-  voc: '#10B981',
+  pm10: '#EA580C',
+  co:   '#EF4444',
+  no2:  '#A855F7',
+  co2:  '#3B82F6',
+  o3:   '#06B6D4',
+  voc:  '#10B981',
 };
 
 export default function TrendChart({ history = [], timeRange = '1H', gasKey = null }) {

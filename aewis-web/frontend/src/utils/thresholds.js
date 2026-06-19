@@ -1,13 +1,24 @@
 // WHO/EPA thresholds and status levels for each pollutant
 
 export const GAS_META = {
+  pm1: {
+    label: 'PM1',
+    unit: 'µg/m³',
+    chip: 'BMV080',
+    max: 75,
+    warn: 10,
+    crit: 25,
+    whoGuideline: 5,
+    description: 'Ultra-fine particulate matter (≤1µm). Measured by BMV080 sensor.',
+    healthImpact: 'Ultra-fine particles penetrate deepest into the bloodstream, posing the highest cardiovascular risk.',
+  },
   pm25: {
     label: 'PM2.5',
     unit: 'µg/m³',
-    chip: 'SPS30',
-    max: 250,
-    warn: 35.4,
-    crit: 55.4,
+    chip: 'BMV080',
+    max: 150,
+    warn: 12.0,
+    crit: 35.4,
     whoGuideline: 15, // 24h WHO 2021
     description: 'Fine particulate matter (≤2.5µm). Penetrates deep into lungs and bloodstream.',
     healthImpact: 'Long-term exposure causes cardiovascular and respiratory disease. Increases risk of lung cancer.',
@@ -15,10 +26,10 @@ export const GAS_META = {
   pm10: {
     label: 'PM10',
     unit: 'µg/m³',
-    chip: 'SPS30',
-    max: 500,
-    warn: 154,
-    crit: 254,
+    chip: 'BMV080',
+    max: 300,
+    warn: 54,
+    crit: 154,
     whoGuideline: 45,
     description: 'Coarse particulate matter (≤10µm). Causes respiratory irritation.',
     healthImpact: 'Causes coughing, wheezing, and aggravates asthma. Long-term exposure affects lung function.',
@@ -80,8 +91,8 @@ export const GAS_META = {
   },
 };
 
-// pm25/pm10 removed — no particle sensor in this hardware (SCD4x + ZE07 + ZE25A + GM-102B + SGP41)
-export const GAS_KEYS = ['co', 'no2', 'co2', 'o3', 'voc'];
+// Gas channels: BMV080 particulate (pm1, pm25, pm10) + electrochemical/optical gas sensors
+export const GAS_KEYS = ['pm1', 'pm25', 'pm10', 'co', 'no2', 'co2', 'o3', 'voc'];
 
 export function getStatus(pollutant, value) {
   if (value == null || value < 0) return { level: 'Unknown', color: '#6B7280', badge: 'UNKN' };

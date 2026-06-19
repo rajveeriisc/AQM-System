@@ -64,7 +64,12 @@ export default function GasGauge({ gasKey, value, history = [] }) {
           )}
           {/* Value text */}
           <text x={cx} y={cy - 2} textAnchor="middle" className="font-mono fill-gray-900 dark:fill-white" style={{ fontSize: '14px', fontWeight: 700, fontFamily: 'monospace' }}>
-            {fmt(value, (gasKey === 'o3' || gasKey === 'no2') ? 3 : (gasKey === 'voc' || gasKey === 'co2') ? 0 : 1)}
+            {fmt(value,
+              (gasKey === 'o3' || gasKey === 'no2') ? 3
+              : (gasKey === 'voc' || gasKey === 'co2') ? 0
+              : (gasKey === 'pm1' || gasKey === 'pm25' || gasKey === 'pm10') ? 1
+              : 1
+            )}
           </text>
           <text x={cx} y={cy + 10} textAnchor="middle" className="fill-gray-500 dark:fill-gray-400" style={{ fontSize: '7px' }}>
             {meta.unit}

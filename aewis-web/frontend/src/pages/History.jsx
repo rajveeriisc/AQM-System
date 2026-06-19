@@ -53,7 +53,7 @@ export default function History() {
     setSelectedDay(dateStr);
     try {
       const { data } = await client.get('/readings/hourly', { params: { deviceId: selectedDeviceId, date: dateStr } });
-      setDayHistory(data.map((h) => ({ ts: `${dateStr}T${String(h.hour).padStart(2, '0')}:00:00Z`, aqi: h.avgAqi, pm25: h.avgPm25, co: h.avgCo, no2: h.avgNo2, co2: h.avgCo2, o3: h.avgO3, voc: h.avgVoc })));
+      setDayHistory(data.map((h) => ({ ts: `${dateStr}T${String(h.hour).padStart(2, '0')}:00:00Z`, aqi: h.avgAqi, pm1: h.avgPm1, pm25: h.avgPm25, pm10: h.avgPm10, co: h.avgCo, no2: h.avgNo2, co2: h.avgCo2, o3: h.avgO3, voc: h.avgVoc })));
     } catch (e) { console.error(e); }
   }
 
@@ -153,7 +153,7 @@ export default function History() {
                 </tr>
               </thead>
               <tbody>
-                {['pm25', 'pm10', 'co', 'no2', 'co2', 'o3', 'voc', 'aqi'].map((key) => (
+                {['pm1', 'pm25', 'pm10', 'co', 'no2', 'co2', 'o3', 'voc', 'aqi'].map((key) => (
                   stats[key] && (
                     <tr key={key} className="border-b border-gray-100 dark:border-gray-800/50 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors">
                       <td className="py-3 pr-4 font-bold text-gray-900 dark:text-white">{key.toUpperCase()}</td>

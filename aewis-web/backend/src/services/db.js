@@ -117,6 +117,11 @@ async function initSchema() {
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS mac_address TEXT;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS ip_address TEXT;
 
+    -- Migration: add BMV080 particulate matter columns to existing databases
+    ALTER TABLE readings ADD COLUMN IF NOT EXISTS pm1  REAL;
+    ALTER TABLE readings ADD COLUMN IF NOT EXISTS pm25 REAL;
+    ALTER TABLE readings ADD COLUMN IF NOT EXISTS pm10 REAL;
+
     CREATE TABLE IF NOT EXISTS pairing_codes (
       code       CHAR(6)      PRIMARY KEY,
       user_id    UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -18,6 +18,7 @@ export function getSocket() {
 }
 
 export function useSocket() {
+  const devices = useStore((s) => s.devices);
   const selectedDeviceId = useStore((s) => s.selectedDeviceId);
   const setLiveReading = useStore((s) => s.setLiveReading);
   const appendReading = useStore((s) => s.appendReading);
@@ -25,19 +26,24 @@ export function useSocket() {
   const resolveAlert = useStore((s) => s.resolveAlert);
   const updateDeviceStatus = useStore((s) => s.updateDeviceStatus);
   const prevDeviceRef = useRef(null);
+  const subscribedRoomsRef = useRef(new Set());
 
+  // Register event handlers once
   useEffect(() => {
     const sock = getSocket();
-
     if (!sock.connected) sock.connect();
 
     const onSensorUpdate = (reading) => {
-      setLiveReading(reading);
-      appendReading(reading);
+      // Only update live reading for the currently selected device
+      if (reading.deviceId === selectedDeviceId || !reading.deviceId) {
+        setLiveReading(reading);
+        appendReading(reading);
+      }
     };
     const onAlertNew = (alert) => addAlert(alert);
     const onAlertResolved = ({ alertId }) => resolveAlert(alertId);
-    const onDeviceStatus = ({ deviceId, status, lastSeen }) => updateDeviceStatus(deviceId, status, lastSeen);
+    const onDeviceStatus = ({ deviceId, status, lastSeen }) =>
+      updateDeviceStatus(deviceId, status, lastSeen);
 
     sock.on('sensor:update', onSensorUpdate);
     sock.on('alert:new', onAlertNew);
@@ -50,30 +56,42 @@ export function useSocket() {
       sock.off('alert:resolved', onAlertResolved);
       sock.off('device:status', onDeviceStatus);
     };
-  }, []);
+  }, [selectedDeviceId]);
 
-  // Subscribe/unsubscribe when device changes — re-subscribes on every reconnect
+  // Subscribe to ALL owned device rooms so device:status reaches us for every device
   useEffect(() => {
     const sock = getSocket();
+    const currentIds = new Set(devices.map((d) => d.id));
 
-    const doSubscribe = () => {
-      if (prevDeviceRef.current && prevDeviceRef.current !== selectedDeviceId) {
-        sock.emit('unsubscribe', { deviceId: prevDeviceRef.current });
+    const doSubscribeAll = () => {
+      // Unsubscribe rooms that are no longer in the device list
+      for (const id of subscribedRoomsRef.current) {
+        if (!currentIds.has(id)) {
+          sock.emit('unsubscribe', { deviceId: id });
+          subscribedRoomsRef.current.delete(id);
+        }
       }
-      if (selectedDeviceId) {
-        sock.emit('subscribe', { deviceId: selectedDeviceId });
+      // Subscribe to any new rooms
+      for (const id of currentIds) {
+        if (!subscribedRoomsRef.current.has(id)) {
+          sock.emit('subscribe', { deviceId: id });
+          subscribedRoomsRef.current.add(id);
+        }
       }
-      prevDeviceRef.current = selectedDeviceId;
     };
 
-    // 'connect' fires on initial connection AND every reconnect (socket.io v4)
-    sock.on('connect', doSubscribe);
-
-    if (sock.connected) doSubscribe();
+    sock.on('connect', doSubscribeAll);
+    if (sock.connected) doSubscribeAll();
 
     return () => {
-      sock.off('connect', doSubscribe);
+      sock.off('connect', doSubscribeAll);
     };
+  }, [devices]);
+
+  // Keep selected device subscription in sync (for sensor:update filtering — no room change needed
+  // since we already subscribe to all device rooms above)
+  useEffect(() => {
+    prevDeviceRef.current = selectedDeviceId;
   }, [selectedDeviceId]);
 
   return { socket };

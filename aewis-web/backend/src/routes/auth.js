@@ -136,23 +136,22 @@ router.post('/resetpassword', authLimiter, async (req, res) => {
 });
 
 // POST /api/auth/changepassword  (authenticated — user knows their current password)
-router.post('/changepassword', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+const { requireAuth } = require('../middleware/auth');
+router.post('/changepassword', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
   if (newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
-    const payload = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
-    const { rows } = await query('SELECT * FROM users WHERE id = $1', [payload.userId]);
+    const { rows } = await query('SELECT * FROM users WHERE id = $1', [req.user.userId]);
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     const valid = await bcrypt.compare(currentPassword, rows[0].password_hash);
     if (!valid) return res.status(400).json({ error: 'Current password is incorrect' });
     const hash = await bcrypt.hash(newPassword, 12);
-    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, payload.userId]);
+    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.userId]);
     res.json({ ok: true });
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
+  } catch (err) {
+    console.error('Change password error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

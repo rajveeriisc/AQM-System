@@ -1,29 +1,34 @@
 /**
  * ═══════════════════════════════════════════════════════════════
  *  AEWIS Air Quality Monitor — ESP32-S3 + 4.2" E-Paper GDEY042T81
- *  Firmware v1.1 — Sensors · Display · WiFi · MQTT · BLE Provisioning
+ *  Firmware v1.2 — Sensors · Display · WiFi · HTTP · AP Provisioning
+ *              + Bosch BMV080 particulate matter sensor (PM1/PM2.5/PM10)
  * ═══════════════════════════════════════════════════════════════
  *
  *  FIRST BOOT (no WiFi stored)
- *    → Display shows SETUP MODE screen + BLE device name
- *    → BLE advertises as "AEWIS-XXXXXX"
- *    → Open AEWIS dashboard → Add Device → Bluetooth wizard
- *    → Dashboard writes WiFi creds + backend URL via GATT
- *    → Device connects WiFi, registers with backend, starts MQTT
+ *    → Display shows SETUP MODE screen
+ *    → AP "AEWIS-XXXXXX" starts; connect to it and open any browser
+ *    → Captive portal page appears; fill WiFi + dashboard code
+ *    → Device connects WiFi, provisions with backend (stores token in NVS)
+ *    → Sends readings every 10 s with x-device-token header
  *
  *  NORMAL BOOT (credentials in NVS)
- *    → Connects WiFi → MQTT broker
- *    → Reads all sensors every 10 s
- *    → Updates E-Paper display (partial refresh)
- *    → Publishes JSON to  aewis/devices/{id}/readings
- *    → Live data appears on web dashboard in real time
+ *    → Loads WiFi creds + provision_token from NVS
+ *    → Connects WiFi → NTP
+ *    → Reads all sensors every 10 s, updates display, POSTs to backend
  *
- *  RESET PROVISIONING  →  clear NVS and reboot:
+ *  RESET PROVISIONING  →  build with ALWAYS_CLEAR_NVS 1, or via MQTT cmd:
  *    prefs.begin("aewis", false); prefs.clear(); prefs.end(); ESP.restart();
+ *
+ *  BMV080 (PM1/PM2.5/PM10):
+ *    Communicates via SPI (default) or I2C depending on variant.
+ *    TODO: Replace stub below with actual Bosch BMV080 SPI/I2C driver.
+ *    Until the driver is integrated, readBMV080() returns -1.0 for all
+ *    channels and the backend receives JSON null for pm1/pm25/pm10.
  *
  *  platformio.ini  lib_deps additions:
  *    knolleary/PubSubClient @ ^2.8
- *    (all existing sensor + display libs unchanged)
+ *    (BMV080: add boschsensortec/BMV080-Sensor-API when available on PIO)
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -123,12 +128,35 @@
 #define NO2_WARMUP_MS       300000UL    // 5 min (datasheet: >5 min)
 
 // ─────────────────────────────────────────────────────────────
-//  Display layout  (unchanged)
+//  Display layout  (400×300 px GDEY042T81)
+//
+//  7 sensor rows fit between title (y≈35+25=60) and status bar (y=260).
+//  Available height: 260 − 60 = 200 px → ROW_DY = 200/7 ≈ 28 px.
+//  Using ROW_Y0=62, ROW_DY=28: rows at 62,90,118,146,174,202,230
+//  last row bottom ≈ 246, status bar starts at 260 → 14 px clear.
 // ─────────────────────────────────────────────────────────────
-#define ROW_Y0         92
-#define ROW_DY         38
+#define ROW_Y0         62
+#define ROW_DY         28
 #define LABEL_X        12
-#define VALUE_RIGHT_X  375
+#define VALUE_RIGHT_X  395
+
+// ─────────────────────────────────────────────────────────────
+//  PM thresholds — EPA NAAQS
+// ─────────────────────────────────────────────────────────────
+#define PM25_GOOD    12.0f       // μg/m³ — EPA 24-hr Good
+#define PM25_MOD     35.4f       // μg/m³ — EPA 24-hr Moderate
+#define PM10_GOOD    54.0f       // μg/m³ — EPA 24-hr Good
+#define PM10_MOD    154.0f       // μg/m³ — EPA 24-hr Moderate
+
+// ─────────────────────────────────────────────────────────────
+//  BMV080 SPI pin assignments
+//  TODO: Adjust these to match your PCB routing.
+//  The BMV080 shares the e-paper SPI bus (SCK/MOSI) but uses its
+//  own CS pin.  MISO is needed only if reading back sensor data
+//  via full-duplex SPI (check BMV080 datasheet for SDO pin).
+// ─────────────────────────────────────────────────────────────
+#define BMV080_CS      9    // TODO: set correct GPIO
+#define BMV080_MISO   -1    // TODO: set correct GPIO (or -1 if write-only mode)
 
 // ─────────────────────────────────────────────────────────────
 //  Firmware + connectivity constants
@@ -141,6 +169,21 @@
 
 #define SGP41_COND_MS      30000UL
 #define AP_TIMEOUT_MS      600000UL  // 10 min — stop AP if nobody provisions
+
+// ─────────────────────────────────────────────────────────────
+//  Development: set to 1 only to wipe NVS on every boot.
+//  MUST be 0 in production — otherwise device loses credentials
+//  and provision_token on every restart.
+// ─────────────────────────────────────────────────────────────
+#ifndef ALWAYS_CLEAR_NVS
+#define ALWAYS_CLEAR_NVS  0
+#endif
+
+// ─────────────────────────────────────────────────────────────
+//  Captive portal: delay between form submit and WiFi connect
+//  (lets HTTP response reach the browser before AP tears down)
+// ─────────────────────────────────────────────────────────────
+#define PROV_GRACE_MS  1500UL
 
 // ─────────────────────────────────────────────────────────────
 //  Sensor objects
@@ -171,6 +214,7 @@ String   g_deviceId;
 String   g_bleName;
 String   g_backendUrl;
 String   g_mqttHost;
+String   g_provisionToken;     // received from POST /api/devices/provision, sent as x-device-token
 
 float    g_tempC        = 25.0f;
 float    g_rhPct        = 50.0f;
@@ -183,6 +227,9 @@ bool     g_mqttOk          = false;
 uint32_t g_lastMqttRetry   = 0;
 // Provisioning  (written from Captive Portal)
 String           g_pendingSSID, g_pendingPass, g_pendingURL, g_pendingCode, g_pendingMqtt;
+// Captive-portal trigger flags (declared here; set in handleAPSave)
+bool     g_provTrigger   = false;
+uint32_t g_provTriggerMs = 0;
 
 // AP + Captive Portal provisioning
 WebServer  g_apServer(80);
@@ -382,6 +429,50 @@ float readNO2_ppm() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  BMV080 — Bosch Particulate Matter Sensor (PM1, PM2.5, PM10)
+// ───────────────────────────────────────────────────────────────
+//  Interface: SPI (CPOL=0, CPHA=0, up to 10 MHz).
+//  CS pin: BMV080_CS.  Shares SCK/MOSI with e-paper; dedicated CS.
+//
+//  TODO — replace this stub with the real SPI/I2C driver:
+//    1. Add boschsensortec/BMV080-Sensor-API to platformio.ini lib_deps
+//       (or clone from https://github.com/boschsensortec/BMV080_SensorAPI)
+//    2. #include "BMV080.h"  and instantiate the BMV080 object.
+//    3. In setup(), call bmv080.begin() after SPI.begin().
+//    4. Replace the stub body below with bmv080.readPM() calls.
+//
+//  Pin wiring (example):
+//    BMV080 VDD → 3.3 V
+//    BMV080 GND → GND
+//    BMV080 SDI → GPIO 11 (shared MOSI)
+//    BMV080 SCK → GPIO 12 (shared SCK)
+//    BMV080 SDO → GPIO BMV080_MISO (or float for SPI write-only)
+//    BMV080 CSB → GPIO BMV080_CS   (unique per device)
+//    BMV080 INT → not connected (polling mode)
+//
+//  Expected values from user:  PM1=2, PM2.5=5, PM10=7 μg/m³
+// ═══════════════════════════════════════════════════════════════
+struct BMV080Data { float pm1; float pm25; float pm10; };
+
+BMV080Data readBMV080() {
+    BMV080Data d = { -1.0f, -1.0f, -1.0f };
+
+    // ── STUB: replace the block below once the real driver is wired in ──
+    //
+    // Example (pseudo-code, replace with actual API):
+    //   if (!bmv080.isDataReady()) return d;
+    //   d.pm1  = bmv080.getPM1();
+    //   d.pm25 = bmv080.getPM25();
+    //   d.pm10 = bmv080.getPM10();
+    //   Serial.printf("[BMV080] PM1=%.1f PM2.5=%.1f PM10=%.1f μg/m³\n",
+    //                 d.pm1, d.pm25, d.pm10);
+    //
+    // Until the driver is integrated, return -1 so the JSON sends null.
+    Serial.println("[BMV080] Stub — driver not yet integrated; reporting null");
+    return d;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  DISPLAY — unchanged layouts + 3 new screens
 // ═══════════════════════════════════════════════════════════════
 void fullClear() {
@@ -411,11 +502,12 @@ void drawStaticLayout() {
         display.print(T);
 
         display.setFont(&FreeMonoBold12pt7b);
+        // 7 rows: CO2, T/RH, VOC, CO, O3, NO2, PM
         static const char *labels[] = {
             "CO2  :", "T/RH :", "VOC  :",
-            "CO   :", "O3   :", "NO2  :"
+            "CO   :", "O3   :", "NO2  :", "PM   :"
         };
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             display.setCursor(LABEL_X, ROW_Y0 + i * ROW_DY);
             display.print(labels[i]);
         }
@@ -430,48 +522,66 @@ void printRightAligned(int y, const char* str) {
 }
 
 // ── Sensor values (partial update, right column) ─────────────
+// pm1/pm25/pm10 in μg/m³; pass -1.0 when sensor not yet ready.
 void updateValues(uint16_t co2, float temp, float rh,
-                  int32_t voc, float co, float o3, float no2) {
+                  int32_t voc, float co, float o3, float no2,
+                  float pm1, float pm25, float pm10) {
     char buf[64];
     const uint16_t valX = LABEL_X + 110;
     const uint16_t valW = display.width() - valX;
-    display.setPartialWindow(valX, ROW_Y0 - 22, valW, ROW_DY * 6 + 48);
+    // 7 rows now (added PM row); extend partial window accordingly
+    display.setPartialWindow(valX, ROW_Y0 - 22, valW, ROW_DY * 7 + 48);
     display.firstPage();
     do {
-        display.fillRect(valX, ROW_Y0 - 22, valW, ROW_DY * 6 + 48, GxEPD_WHITE);
+        display.fillRect(valX, ROW_Y0 - 22, valW, ROW_DY * 7 + 48, GxEPD_WHITE);
         display.setFont(&FreeMonoBold12pt7b);
         display.setTextColor(GxEPD_BLACK);
         int y = ROW_Y0;
 
+        // CO2
         if (co2 <= 0) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
         else          snprintf(buf, sizeof(buf), "%5d ppm [%s]", co2, qli(co2, CO2_GOOD, CO2_MOD));
         printRightAligned(y, buf); y += ROW_DY;
 
+        // Temperature / Humidity
         snprintf(buf, sizeof(buf), "%+5.1fC   %4.1f%%", temp, rh);
         printRightAligned(y, buf); y += ROW_DY;
 
+        // VOC index
         if (voc <= 0) snprintf(buf, sizeof(buf), "  ---- idx [N/A]");
         else          snprintf(buf, sizeof(buf), "%5d idx [%s]", (int)voc, qli(voc, VOC_GOOD, VOC_MOD));
         printRightAligned(y, buf); y += ROW_DY;
 
+        // CO
         if (co < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
         else           snprintf(buf, sizeof(buf), "%5.1f ppm [%s]", co, qlf(co, CO_GOOD, CO_MOD));
         printRightAligned(y, buf); y += ROW_DY;
 
+        // O3
         if (o3 < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
         else           snprintf(buf, sizeof(buf), "%6.3f ppm [%s]", o3, qlf(o3, O3_GOOD, O3_MOD));
         printRightAligned(y, buf); y += ROW_DY;
 
+        // NO2
         if (no2 < 0.0f) snprintf(buf, sizeof(buf), "  ---- ppm [N/A]");
         else            snprintf(buf, sizeof(buf), "%5.3f ppm [%s]", no2, qlf(no2, NO2_GOOD, NO2_MOD));
+        printRightAligned(y, buf); y += ROW_DY;
+
+        // PM (BMV080) — show PM2.5 as primary quality indicator
+        if (pm25 < 0.0f)
+            snprintf(buf, sizeof(buf), "  ---- ug/m3 [N/A]");
+        else
+            snprintf(buf, sizeof(buf), "%.1f/%.1f/%.1f [%s]",
+                     pm1, pm25, pm10, qlf(pm25, PM25_GOOD, PM25_MOD));
         printRightAligned(y, buf);
     } while (display.nextPage());
 }
 
 // ── NEW: connectivity status bar (bottom strip, partial) ─────
 void updateStatusBar(bool wifiOk, bool mqttOk, const String& ip) {
-    const int16_t SB_Y = 270;
-    const int16_t SB_H = 28;
+    // Row 7 ends at ROW_Y0 + 6*ROW_DY + 16 ≈ 62+168+16=246; leave 14px gap
+    const int16_t SB_Y = 260;
+    const int16_t SB_H = 40;  // 300 - 260 = 40 px remaining
     display.setPartialWindow(0, SB_Y, display.width(), SB_H);
     display.firstPage();
     do {
@@ -484,7 +594,7 @@ void updateStatusBar(bool wifiOk, bool mqttOk, const String& ip) {
                      ip.c_str(), mqttOk ? "OK" : "--");
         else
             snprintf(buf, sizeof(buf), "WiFi:-- MQTT:--");
-        display.setCursor(LABEL_X, SB_Y + 20);
+        display.setCursor(LABEL_X, SB_Y + 26);
         display.print(buf);
     } while (display.nextPage());
 }
@@ -506,7 +616,7 @@ void drawProvisioningScreen() {
 
         display.setFont(&FreeMonoBold12pt7b);
 
-
+        char line[48];
         snprintf(line, sizeof(line), "ID  : %s", g_deviceId.c_str());
         display.getTextBounds(line, 0, 0, &bx, &by, &bw, &bh);
         display.setCursor((display.width() - bw) / 2 - bx, 130);
@@ -766,10 +876,14 @@ bool connectWiFi(const String& ssid, const String& pass) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Backend HTTP provision  (called once after first WiFi join)
+//  Backend HTTP provision  (called once after WiFi join)
+//  Sends device_id, mac, firmware_version, ip, pairing_code.
+//  Parses "provision_token" from response JSON and stores in NVS.
+//  The token is subsequently sent as x-device-token on every reading.
 // ═══════════════════════════════════════════════════════════════
 void httpProvision() {
     if (g_backendUrl.isEmpty()) return;
+
     HTTPClient http;
     String url = g_backendUrl + "/api/devices/provision";
     http.begin(url);
@@ -780,6 +894,7 @@ void httpProvision() {
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     char body[256];
     if (g_pendingCode.isEmpty()) {
         snprintf(body, sizeof(body),
@@ -799,6 +914,35 @@ void httpProvision() {
 
     int code = http.POST(body);
     Serial.printf("[HTTP] Provision → %d\n", code);
+
+    if (code == 200 || code == 201) {
+        // Parse provision_token from JSON response.
+        // Response shape: {"provision_token":"<token>", ...}
+        // Minimal manual parse — avoids pulling in a JSON library.
+        String resp = http.getString();
+        Serial.printf("[HTTP] Provision response: %s\n", resp.c_str());
+
+        int keyIdx = resp.indexOf("\"provision_token\"");
+        if (keyIdx >= 0) {
+            int q1 = resp.indexOf('"', keyIdx + 17); // skip key
+            if (q1 >= 0) q1 = resp.indexOf('"', q1 + 1); // opening quote of value
+            int q2 = (q1 >= 0) ? resp.indexOf('"', q1 + 1) : -1;
+            if (q1 >= 0 && q2 > q1) {
+                g_provisionToken = resp.substring(q1 + 1, q2);
+                Serial.printf("[HTTP] provision_token stored (%d chars)\n",
+                              g_provisionToken.length());
+                // Persist so it survives reboot (not erased on normal boot)
+                prefs.begin("aewis", false);
+                prefs.putString("prov_token", g_provisionToken);
+                prefs.end();
+            }
+        } else {
+            Serial.println("[HTTP] WARNING: provision_token not found in response");
+        }
+    } else {
+        Serial.printf("[HTTP] Provision failed: %d — %s\n",
+                      code, http.errorToString(code).c_str());
+    }
     http.end();
 }
 
@@ -861,17 +1005,29 @@ void publishProvision() {
     mqtt.publish(topic, payload);
 }
 
+// pm1/pm25/pm10 in μg/m³; pass -1.0 for channels not yet available.
 void publishReading(uint16_t co2, float temp, float rh,
-                    int32_t voc, float co, float o3, float no2) {
-    // Serialise each field — use JSON null for sensors still warming up
-    char coS[10], o3S[10], no2S[10], vocS[10], co2S[10];
-    if (co   < 0.0f) snprintf(coS,  10, "null"); else snprintf(coS,  10, "%.2f",  co);
-    if (o3   < 0.0f) snprintf(o3S,  10, "null"); else snprintf(o3S,  10, "%.4f",  o3);
-    if (no2  < 0.0f) snprintf(no2S, 10, "null"); else snprintf(no2S, 10, "%.4f",  no2);
-    if (voc  <= 0)   snprintf(vocS, 10, "null"); else snprintf(vocS, 10, "%d",    (int)voc);
-    if (co2  == 0)   snprintf(co2S, 10, "null"); else snprintf(co2S, 10, "%d",    co2);
+                    int32_t voc, float co, float o3, float no2,
+                    float pm1, float pm25, float pm10) {
+    if (g_backendUrl.isEmpty()) {
+        Serial.println("[HTTP] No backend URL — skipping reading");
+        return;
+    }
 
-    // ISO timestamp if NTP is synced
+    // Serialise each field — JSON null for sensors still warming up
+    char coS[10], o3S[10], no2S[10], vocS[10], co2S[10];
+    char pm1S[10], pm25S[10], pm10S[10];
+
+    if (co   < 0.0f) snprintf(coS,   sizeof(coS),   "null"); else snprintf(coS,   sizeof(coS),   "%.2f", co);
+    if (o3   < 0.0f) snprintf(o3S,   sizeof(o3S),   "null"); else snprintf(o3S,   sizeof(o3S),   "%.4f", o3);
+    if (no2  < 0.0f) snprintf(no2S,  sizeof(no2S),  "null"); else snprintf(no2S,  sizeof(no2S),  "%.4f", no2);
+    if (voc  <= 0)   snprintf(vocS,  sizeof(vocS),  "null"); else snprintf(vocS,  sizeof(vocS),  "%d",   (int)voc);
+    if (co2  == 0)   snprintf(co2S,  sizeof(co2S),  "null"); else snprintf(co2S,  sizeof(co2S),  "%d",   co2);
+    if (pm1  < 0.0f) snprintf(pm1S,  sizeof(pm1S),  "null"); else snprintf(pm1S,  sizeof(pm1S),  "%.2f", pm1);
+    if (pm25 < 0.0f) snprintf(pm25S, sizeof(pm25S), "null"); else snprintf(pm25S, sizeof(pm25S), "%.2f", pm25);
+    if (pm10 < 0.0f) snprintf(pm10S, sizeof(pm10S), "null"); else snprintf(pm10S, sizeof(pm10S), "%.2f", pm10);
+
+    // ISO 8601 timestamp when NTP is synced (stays "null" if not synced)
     char ts[28] = "null";
     struct tm ti;
     if (getLocalTime(&ti, 100)) {
@@ -880,26 +1036,38 @@ void publishReading(uint16_t co2, float temp, float rh,
         strncpy(ts, tmp, sizeof(ts) - 1);
     }
 
-    char payload[380];
+    // Payload < 512 bytes — well within 1 MB limit
+    char payload[512];
     snprintf(payload, sizeof(payload),
-        "{\"device_id\":\"%s\",\"co2\":%s,\"temp\":%.1f,\"rh\":%.1f,\"voc\":%s,"
-        "\"co\":%s,\"o3\":%s,\"no2\":%s,\"ts\":%s}",
-        g_deviceId.c_str(), co2S, temp, rh, vocS, coS, o3S, no2S, ts);
-
-    if (g_backendUrl.isEmpty()) {
-        Serial.println("[HTTP] No backend URL to post readings");
-        return;
-    }
+        "{\"device_id\":\"%s\","
+        "\"co2\":%s,\"temp\":%.1f,\"rh\":%.1f,\"voc\":%s,"
+        "\"co\":%s,\"o3\":%s,\"no2\":%s,"
+        "\"pm1\":%s,\"pm25\":%s,\"pm10\":%s,"
+        "\"ts\":%s}",
+        g_deviceId.c_str(),
+        co2S, temp, rh, vocS,
+        coS, o3S, no2S,
+        pm1S, pm25S, pm10S,
+        ts);
 
     HTTPClient http;
     http.begin(g_backendUrl + "/api/readings");
     http.addHeader("Content-Type", "application/json");
+    http.setTimeout(8000);  // prevent blocking the loop indefinitely
+
+    // x-device-token: required by backend for authenticated device reads
+    if (!g_provisionToken.isEmpty())
+        http.addHeader("x-device-token", g_provisionToken);
+    else
+        Serial.println("[HTTP] WARNING: no provision_token — readings may be rejected");
+
     int code = http.POST(payload);
-    if (code == 201 || code == 200) {
-        Serial.printf("[HTTP] ✓ Readings sent (%d)\n", code);
-        g_mqttOk = true; // Use MQTT status LED/icon to represent HTTP success
+    if (code == 200 || code == 201) {
+        Serial.printf("[HTTP] Readings sent OK (%d)\n", code);
+        g_mqttOk = true;  // reused as "backend reachable" indicator on status bar
     } else {
-        Serial.printf("[HTTP] ✗ Failed to send readings: %d - %s\n", code, http.errorToString(code).c_str());
+        Serial.printf("[HTTP] Readings failed: %d — %s\n",
+                      code, http.errorToString(code).c_str());
         g_mqttOk = false;
     }
     http.end();
@@ -977,11 +1145,18 @@ void setup() {
     // Wait up to 3 s for serial monitor; boot normally if none is attached
     { uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10); delay(100); }
 
-    // ── ALWAYS ERASE PREVIOUS MEMORY (User requested) ─────────
-    prefs.begin("aewis", false); 
-    prefs.clear(); 
+    // ── NVS wipe — development only ───────────────────────────
+    // ALWAYS_CLEAR_NVS must be 0 in production firmware.
+    // When 1, the device loses its WiFi creds, backend URL, and
+    // provision_token on every restart → can never reconnect after reboot.
+    // Build with -DALWAYS_CLEAR_NVS=1 (platformio.ini build_flags) to
+    // force re-provisioning during development / factory reset testing.
+#if ALWAYS_CLEAR_NVS
+    prefs.begin("aewis", false);
+    prefs.clear();
     prefs.end();
-    Serial.println("[BOOT] Device memory has been completely erased.");
+    Serial.println("[BOOT] ALWAYS_CLEAR_NVS=1 — NVS erased (dev mode)");
+#endif
 
     // ── Hardware init ─────────────────────────────────────────
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -995,7 +1170,7 @@ void setup() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_0db);   // 0–0.75 V range for NO2 — critical for clean-air signal
 
-    scd4x.begin(Wire);
+    scd4x.begin(Wire, ADDR_SCD4X);
     uint16_t scdErr = scd4x.stopPeriodicMeasurement();
     if (scdErr) Serial.printf("[I2C] SCD4x stopPeriodicMeasurement failed: %d\n", scdErr);
     delay(500);
@@ -1031,7 +1206,11 @@ void setup() {
     String storedPass    = prefs.getString("wifi_pass",   "");
     g_backendUrl         = prefs.getString("backend_url", "");
     String storedMqtt    = prefs.getString("mqtt_host",   "");
+    g_provisionToken     = prefs.getString("prov_token",  ""); // auth token for /api/readings
     prefs.end();
+    if (!g_provisionToken.isEmpty())
+        Serial.printf("[BOOT] provision_token loaded from NVS (%d chars)\n",
+                      g_provisionToken.length());
 
     if (storedSSID.isEmpty()) {
         // ── FIRST BOOT: start AP provisioning ──────────
@@ -1068,6 +1247,7 @@ void loop() {
     static float    lastTemp = 25.0f, lastRH = 50.0f;
     static int32_t  lastVOC  = 0;
     static float    lastCO   = -1.0f, lastO3 = -1.0f, lastNO2 = -1.0f;
+    static float    lastPM1  = -1.0f, lastPM25 = -1.0f, lastPM10 = -1.0f;
 
     // ── AP captive portal — service DNS + HTTP every loop ───────
     if (g_apRunning) {
@@ -1179,11 +1359,20 @@ void loop() {
         lastO3  = readO3_ppm();
         lastNO2 = readNO2_ppm();
 
+        // BMV080 particulate matter (PM1, PM2.5, PM10)
+        {
+            BMV080Data pm = readBMV080();
+            lastPM1  = pm.pm1;
+            lastPM25 = pm.pm25;
+            lastPM10 = pm.pm10;
+        }
+
         // Update E-Paper
         if (g_state == ST_RUNNING) {
             updateValues(lastCO2, lastTemp, lastRH,
-                         lastVOC, lastCO, lastO3, lastNO2);
-            // Redraw status bar — updateValues() partial window overlaps it (Bug fix #5)
+                         lastVOC, lastCO, lastO3, lastNO2,
+                         lastPM1, lastPM25, lastPM10);
+            // Redraw status bar — updateValues() partial window overlaps it
             updateStatusBar(g_wifiOk, g_mqttOk,
                             g_wifiOk ? WiFi.localIP().toString() : "");
         }
@@ -1191,6 +1380,7 @@ void loop() {
         // Publish to backend → dashboard via HTTP POST
         if (g_state == ST_RUNNING)
             publishReading(lastCO2, lastTemp, lastRH,
-                           lastVOC, lastCO, lastO3, lastNO2);
+                           lastVOC, lastCO, lastO3, lastNO2,
+                           lastPM1, lastPM25, lastPM10);
     }
 }

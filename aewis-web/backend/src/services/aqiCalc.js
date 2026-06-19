@@ -68,30 +68,38 @@ function linearScale(c, bp) {
 function calcAQI(reading) {
   const indices = [];
 
+  // PM2.5 is the primary BMV080 sensor output — calculate first
   if (reading.pm25 != null) {
     const v = linearScale(parseFloat(reading.pm25), PM25_BREAKPOINTS);
-    indices.push({ value: v, pollutant: 'pm25' });
+    indices.push({ value: v, pollutant: 'pm25', priority: 1 });
   }
   if (reading.pm10 != null) {
     const v = linearScale(parseFloat(reading.pm10), PM10_BREAKPOINTS);
-    indices.push({ value: v, pollutant: 'pm10' });
+    indices.push({ value: v, pollutant: 'pm10', priority: 2 });
   }
   if (reading.co != null) {
     const v = linearScale(parseFloat(reading.co), CO_BREAKPOINTS);
-    indices.push({ value: v, pollutant: 'co' });
+    indices.push({ value: v, pollutant: 'co', priority: 3 });
   }
   if (reading.no2 != null) {
     const v = linearScale(parseFloat(reading.no2), NO2_BREAKPOINTS);
-    indices.push({ value: v, pollutant: 'no2' });
+    indices.push({ value: v, pollutant: 'no2', priority: 3 });
   }
   if (reading.o3 != null) {
     const v = linearScale(parseFloat(reading.o3), O3_BREAKPOINTS_8H);
-    indices.push({ value: v, pollutant: 'o3' });
+    indices.push({ value: v, pollutant: 'o3', priority: 3 });
   }
 
   if (!indices.length) return { aqi: 0, primaryPollutant: null };
 
-  const dominant = indices.reduce((a, b) => (a.value > b.value ? a : b));
+  // Dominant = highest AQI value. When tied, prefer PM2.5 over PM10 over others
+  // (priority field: lower number wins ties).
+  const dominant = indices.reduce((a, b) => {
+    if (b.value > a.value) return b;
+    if (b.value === a.value && b.priority < a.priority) return b;
+    return a;
+  });
+
   return { aqi: dominant.value, primaryPollutant: dominant.pollutant };
 }
 

@@ -2,6 +2,17 @@ const { query } = require('./db');
 const { sendAlertEmail } = require('./emailService');
 const { getIO } = require('../socket/emitter');
 
+// Default thresholds applied when no user-defined rule exists for a pollutant.
+// Values follow WHO / US EPA guidance for 24-hour exposure:
+//   PM2.5:  warn 12 μg/m³ (EPA Annual NAAQS)  crit 35.4 μg/m³ (EPA 24h NAAQS)
+//   PM10:   warn 54 μg/m³ (EPA 24h boundary)  crit 154 μg/m³ (EPA 24h NAAQS)
+//   PM1:    no official standard; using WHO-informed conservative levels
+const DEFAULT_THRESHOLDS = {
+  pm25: { warn: 12,  crit: 35.4, cooldown_min: 15 },
+  pm10: { warn: 54,  crit: 154,  cooldown_min: 15 },
+  pm1:  { warn: 10,  crit: 25,   cooldown_min: 15 },
+};
+
 // Cooldown check via DB — survives process restarts and works across PM2 instances.
 // Looks for an un-resolved alert for this device+pollutant created within the cooldown window.
 async function isCoolingDown(deviceId, pollutant, cooldownMinutes) {
@@ -9,7 +20,7 @@ async function isCoolingDown(deviceId, pollutant, cooldownMinutes) {
     `SELECT 1 FROM alerts
      WHERE device_id = $1 AND pollutant = $2
        AND resolved_at IS NULL
-       AND ts > NOW() - ($3 || ' minutes')::interval
+       AND ts > NOW() - ($3 * interval '1 minute')
      LIMIT 1`,
     [deviceId, pollutant, cooldownMinutes]
   );
@@ -18,13 +29,37 @@ async function isCoolingDown(deviceId, pollutant, cooldownMinutes) {
 
 async function processReading(deviceId, reading, readingId) {
   // Load alert rules for this device + user
-  const { rows: rules } = await query(
+  const { rows: dbRules } = await query(
     `SELECT ar.* FROM alert_rules ar
      JOIN user_devices ud ON ud.user_id = ar.user_id
      WHERE ud.device_id = $1
        AND (ar.device_id = $1 OR ar.device_id IS NULL)`,
     [deviceId]
   );
+
+  // Merge DB rules with defaults: DB rule wins for any pollutant it covers.
+  // Build a map: pollutant → effective rule object.
+  const ruleMap = new Map();
+
+  // Seed with defaults for PM pollutants provided by BMV080
+  for (const [pollutant, defaults] of Object.entries(DEFAULT_THRESHOLDS)) {
+    if (reading[pollutant] != null) {
+      ruleMap.set(pollutant, {
+        pollutant,
+        warn_threshold: defaults.warn,
+        crit_threshold: defaults.crit,
+        cooldown_min:   defaults.cooldown_min,
+        _isDefault:     true,
+      });
+    }
+  }
+
+  // DB rules always override defaults; also add any non-PM rules from DB
+  for (const rule of dbRules) {
+    ruleMap.set(rule.pollutant, { ...rule, _isDefault: false });
+  }
+
+  const rules = [...ruleMap.values()];
 
   const io = getIO();
 
